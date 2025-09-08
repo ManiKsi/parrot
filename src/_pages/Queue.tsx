@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react"
 import { useQuery } from "@tanstack/react-query"
 import ScreenshotQueue from "../components/Queue/ScreenshotQueue"
 import QueueCommands from "../components/Queue/QueueCommands"
+import VoicePanel from "../components/Voice/VoicePanel"
 
 import { useToast } from "../contexts/toast"
 import { Screenshot } from "../types/screenshots"
@@ -137,9 +138,9 @@ const Queue: React.FC<QueueProps> = ({
   };
   
   return (
-    <div ref={contentRef} className={`bg-transparent w-1/2`}>
+    <div ref={contentRef} className="bg-transparent">
       <div className="px-4 py-3">
-        <div className="space-y-3 w-fit">
+  <div className="space-y-3 w-full max-w-[720px]">
           <ScreenshotQueue
             isLoading={false}
             screenshots={screenshots}
@@ -153,6 +154,7 @@ const Queue: React.FC<QueueProps> = ({
             currentLanguage={currentLanguage}
             setLanguage={setLanguage}
           />
+          <VoicePanel />
         </div>
       </div>
     </div>

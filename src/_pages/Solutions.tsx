@@ -185,6 +185,12 @@ const Solutions: React.FC<SolutionsProps> = ({
     useState<ProblemStatementData | null>(null)
   const [solutionData, setSolutionData] = useState<string | null>(null)
   const [thoughtsData, setThoughtsData] = useState<string[] | null>(null)
+  const [problemExplanation, setProblemExplanation] = useState<string | null>(
+    null
+  )
+  const [solutionExplanation, setSolutionExplanation] = useState<
+    string | null
+  >(null)
   const [timeComplexityData, setTimeComplexityData] = useState<string | null>(
     null
   )
@@ -297,10 +303,12 @@ const Solutions: React.FC<SolutionsProps> = ({
         // Every time processing starts, reset relevant states
         setSolutionData(null)
         setThoughtsData(null)
+  setProblemExplanation(null)
+  setSolutionExplanation(null)
         setTimeComplexityData(null)
         setSpaceComplexityData(null)
       }),
-      window.electronAPI.onProblemExtracted((data) => {
+  window.electronAPI.onProblemExtracted((data: ProblemStatementData) => {
         queryClient.setQueryData(["problem_statement"], data)
       }),
       //if there was an error processing the initial solution
@@ -312,18 +320,29 @@ const Solutions: React.FC<SolutionsProps> = ({
           thoughts: string[]
           time_complexity: string
           space_complexity: string
+          problem_explanation?: string | null
+          solution_explanation?: string | null
         } | null
         if (!solution) {
           setView("queue")
         }
         setSolutionData(solution?.code || null)
         setThoughtsData(solution?.thoughts || null)
+        setProblemExplanation(solution?.problem_explanation || null)
+        setSolutionExplanation(solution?.solution_explanation || null)
         setTimeComplexityData(solution?.time_complexity || null)
         setSpaceComplexityData(solution?.space_complexity || null)
         console.error("Processing error:", error)
       }),
       //when the initial solution is generated, we'll set the solution data to that
-      window.electronAPI.onSolutionSuccess((data) => {
+      window.electronAPI.onSolutionSuccess((data: {
+        code: string
+        thoughts: string[]
+        time_complexity: string
+        space_complexity: string
+        problem_explanation?: string | null
+        solution_explanation?: string | null
+      }) => {
         if (!data) {
           console.warn("Received empty or invalid solution data")
           return
@@ -333,12 +352,16 @@ const Solutions: React.FC<SolutionsProps> = ({
           code: data.code,
           thoughts: data.thoughts,
           time_complexity: data.time_complexity,
-          space_complexity: data.space_complexity
+          space_complexity: data.space_complexity,
+          problem_explanation: data.problem_explanation ?? null,
+          solution_explanation: data.solution_explanation ?? null
         }
 
         queryClient.setQueryData(["solution"], solutionData)
         setSolutionData(solutionData.code || null)
         setThoughtsData(solutionData.thoughts || null)
+        setProblemExplanation(solutionData.problem_explanation || null)
+        setSolutionExplanation(solutionData.solution_explanation || null)
         setTimeComplexityData(solutionData.time_complexity || null)
         setSpaceComplexityData(solutionData.space_complexity || null)
 
@@ -347,7 +370,7 @@ const Solutions: React.FC<SolutionsProps> = ({
           try {
             const existing = await window.electronAPI.getScreenshots()
             const screenshots =
-              existing.previews?.map((p) => ({
+              existing.previews?.map((p: any) => ({
                 id: p.path,
                 path: p.path,
                 preview: p.preview,
@@ -370,7 +393,7 @@ const Solutions: React.FC<SolutionsProps> = ({
         setDebugProcessing(true)
       }),
       //the first time debugging works, we'll set the view to debug and populate the cache with the data
-      window.electronAPI.onDebugSuccess((data) => {
+  window.electronAPI.onDebugSuccess((data: any) => {
         queryClient.setQueryData(["new_solution"], data)
         setDebugProcessing(false)
       }),
@@ -417,10 +440,14 @@ const Solutions: React.FC<SolutionsProps> = ({
           thoughts: string[]
           time_complexity: string
           space_complexity: string
+          problem_explanation?: string | null
+          solution_explanation?: string | null
         } | null
 
         setSolutionData(solution?.code ?? null)
         setThoughtsData(solution?.thoughts ?? null)
+        setProblemExplanation(solution?.problem_explanation ?? null)
+        setSolutionExplanation(solution?.solution_explanation ?? null)
         setTimeComplexityData(solution?.time_complexity ?? null)
         setSpaceComplexityData(solution?.space_complexity ?? null)
       }
@@ -523,6 +550,22 @@ const Solutions: React.FC<SolutionsProps> = ({
 
                 {solutionData && (
                   <>
+                    {problemExplanation && (
+                      <ContentSection
+                        title="Explain the Problem"
+                        content={<div className="whitespace-pre-wrap">{problemExplanation}</div>}
+                        isLoading={false}
+                      />
+                    )}
+
+                    {solutionExplanation && (
+                      <ContentSection
+                        title="Explain the Solution"
+                        content={<div className="whitespace-pre-wrap">{solutionExplanation}</div>}
+                        isLoading={false}
+                      />
+                    )}
+
                     <ContentSection
                       title={`My Thoughts (${COMMAND_KEY} + Arrow keys to scroll)`}
                       content={

@@ -28,6 +28,13 @@ option {
   padding: 8px !important;
 }
 
+/* Hide voice overlay when marked hidden for capture */
+#voice-overlay[data-hidden='1'] {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  visibility: hidden !important;
+}
+
 .frosted-glass {
   background: rgba(26, 26, 26, 0.8);
   backdrop-filter: blur(8px);

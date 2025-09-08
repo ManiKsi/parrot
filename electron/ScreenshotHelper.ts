@@ -2,7 +2,7 @@
 
 import path from "node:path";
 import fs from "node:fs";
-import { app } from "electron";
+import { app, BrowserWindow } from "electron";
 import { v4 as uuidv4 } from "uuid";
 import { execFile } from "child_process";
 import { promisify } from "util";
@@ -292,6 +292,15 @@ export class ScreenshotHelper {
     showMainWindow: () => void
   ): Promise<string> {
     console.log("Taking screenshot in view:", this.view);
+    // Notify renderer to prepare (hide overlays like Voice UI)
+    try {
+      const win = BrowserWindow.getAllWindows()[0];
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('capture:prepare');
+      }
+    } catch (e) {
+      console.warn('Failed to send capture:prepare event', e);
+    }
     hideMainWindow();
 
     // Increased delay for window hiding on Windows
@@ -363,6 +372,15 @@ export class ScreenshotHelper {
       // Increased delay for showing window again
       await new Promise((resolve) => setTimeout(resolve, 200));
       showMainWindow();
+      // Restore overlays
+      try {
+        const win = BrowserWindow.getAllWindows()[0];
+        if (win && !win.isDestroyed()) {
+          win.webContents.send('capture:restore');
+        }
+      } catch (e) {
+        console.warn('Failed to send capture:restore event', e);
+      }
     }
 
     return screenshotPath;

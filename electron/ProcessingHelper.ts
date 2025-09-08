@@ -146,6 +146,161 @@ export class ProcessingHelper {
     throw new Error("App failed to initialize after 5 seconds")
   }
 
+  /**
+   * Attempt to extract and parse a JSON object (or array) from a free-form LLM response.
+   * - Handles fenced code blocks ```json ... ``` or ``` ... ```
+   * - Falls back to scanning for the first balanced {...} or [...] segment
+   * - Trims BOM/surrounding text
+   */
+  private parseJsonFromText(text: string): any {
+    if (!text || typeof text !== 'string') {
+      throw new Error('Empty model response');
+    }
+
+    const trimmed = text.trim();
+
+    // 1) Try fenced code block marked as json first
+    const jsonFenceRegex = /```\s*json\s*([\s\S]*?)```/gi;
+    let match: RegExpExecArray | null;
+    while ((match = jsonFenceRegex.exec(trimmed)) !== null) {
+      const candidate = match[1].trim();
+      try {
+        return JSON.parse(candidate);
+      } catch {
+        // continue
+      }
+    }
+
+    // 2) Try any fenced code block
+    const anyFenceRegex = /```\s*([\s\S]*?)```/gi;
+    while ((match = anyFenceRegex.exec(trimmed)) !== null) {
+      const candidate = match[1].trim();
+      try {
+        return JSON.parse(candidate);
+      } catch {
+        // continue
+      }
+    }
+
+    // 3) If the whole string is JSON
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      // continue
+    }
+
+    // 4) Scan for balanced JSON objects/arrays
+    const tryBalanced = (open: string, close: string) => {
+      for (let i = 0; i < trimmed.length; i++) {
+        if (trimmed[i] === open) {
+          let depth = 0;
+          for (let j = i; j < trimmed.length; j++) {
+            const ch = trimmed[j];
+            if (ch === open) depth++;
+            else if (ch === close) depth--;
+            if (depth === 0) {
+              const candidate = trimmed.slice(i, j + 1);
+              try {
+                return JSON.parse(candidate);
+              } catch {
+                break; // stop this segment and continue scanning
+              }
+            }
+          }
+        }
+      }
+      return undefined;
+    };
+
+    const obj = tryBalanced('{', '}');
+    if (obj !== undefined) return obj;
+    const arr = tryBalanced('[', ']');
+    if (arr !== undefined) return arr;
+
+    // 5) Strip common markdown wrappers and retry quickly
+    const stripped = trimmed.replace(/```json|```/g, '').trim();
+    try {
+      return JSON.parse(stripped);
+    } catch {
+      // No-op
+    }
+
+    throw new Error('No JSON payload found in model response');
+  }
+
+  private shouldLogOpenAI(): boolean {
+    return process.env.ICODER_LOG_OPENAI === '1';
+  }
+
+  private truncate(str: string, max = 500): string {
+    if (!str) return '';
+    return str.length > max ? `${str.slice(0, max)}… (truncated ${str.length - max} chars)` : str;
+  }
+
+  private summarizeOpenAIMessages(messages: any[]): any[] {
+    try {
+      return messages.map((m: any) => {
+        const content = m.content;
+        if (typeof content === 'string') {
+          return {
+            role: m.role,
+            content: this.truncate(content, 600)
+          };
+        }
+        if (Array.isArray(content)) {
+          return {
+            role: m.role,
+            content: content.map((part) => {
+              if (part?.type === 'text') {
+                return { type: 'text', text: this.truncate(part.text || '', 600) };
+              }
+              if (part?.type === 'image_url') {
+                const url: string = part.image_url?.url || '';
+                if (url.startsWith('data:image')) {
+                  const base64Len = url.length;
+                  return { type: 'image_url', url_prefix: url.slice(0, 30), length: base64Len };
+                }
+                return { type: 'image_url', url: this.truncate(url, 200) };
+              }
+              return { ...part, note: 'unsupported-part-type-summarized' };
+            })
+          };
+        }
+        return { role: m.role, content_summary: 'unsupported-content-structure' };
+      });
+    } catch (e) {
+      return [{ error: 'failed to summarize messages', detail: String(e) }];
+    }
+  }
+
+  private logOpenAIRequest(tag: string, model: string, payload: { messages: any; [k: string]: any }): void {
+    if (!this.shouldLogOpenAI()) return;
+    try {
+      const { messages, ...rest } = payload || ({} as any);
+      const summary = this.summarizeOpenAIMessages(messages || []);
+      console.log(`[OpenAI][request][${tag}] model=\"${model}\" payload=`, { ...rest, messages: summary });
+    } catch (e) {
+      console.warn(`[OpenAI][request][${tag}] failed to log:`, e);
+    }
+  }
+
+  private logOpenAIResponse(tag: string, response: any): void {
+    if (!this.shouldLogOpenAI()) return;
+    try {
+      const first = response?.choices?.[0]?.message?.content ?? '';
+      const usage = response?.usage ?? null;
+      console.log(`[OpenAI][response][${tag}]`, {
+        id: response?.id,
+        model: response?.model,
+        created: response?.created,
+        usage,
+        first_choice_preview: this.truncate(first, 1200)
+      });
+    } catch (e) {
+      console.warn(`[OpenAI][response][${tag}] failed to log:`, e);
+    }
+  }
+
   private async getCredits(): Promise<number> {
     const mainWindow = this.deps.getMainWindow()
     if (!mainWindow) return 999 // Unlimited credits in this version
@@ -495,24 +650,28 @@ export class ProcessingHelper {
         ];
 
         // Send to OpenAI Vision API
+        this.logOpenAIRequest('extraction', config.extractionModel || 'gpt-4o', {
+          messages,
+          max_tokens: 4000,
+          temperature: 0.2
+        });
         const extractionResponse = await this.openaiClient.chat.completions.create({
           model: config.extractionModel || "gpt-4o",
           messages: messages,
           max_tokens: 4000,
           temperature: 0.2
         });
+        this.logOpenAIResponse('extraction', extractionResponse);
 
         // Parse the response
         try {
-          const responseText = extractionResponse.choices[0].message.content;
-          // Handle when OpenAI might wrap the JSON in markdown code blocks
-          const jsonText = responseText.replace(/```json|```/g, '').trim();
-          problemInfo = JSON.parse(jsonText);
+          const responseText = extractionResponse.choices[0].message.content || '';
+          problemInfo = this.parseJsonFromText(responseText);
         } catch (error) {
           console.error("Error parsing OpenAI response:", error);
           return {
             success: false,
-            error: "Failed to parse problem information. Please try again or use clearer screenshots."
+            error: "Failed to parse problem information from the AI response. Please try again, adjust the screenshot, or switch models in Settings."
           };
         }
       } else if (config.apiProvider === "gemini")  {
@@ -562,11 +721,8 @@ export class ProcessingHelper {
             throw new Error("Empty response from Gemini API");
           }
           
-          const responseText = responseData.candidates[0].content.parts[0].text;
-          
-          // Handle when Gemini might wrap the JSON in markdown code blocks
-          const jsonText = responseText.replace(/```json|```/g, '').trim();
-          problemInfo = JSON.parse(jsonText);
+          const responseText = responseData.candidates[0].content.parts[0].text || '';
+          problemInfo = this.parseJsonFromText(responseText);
         } catch (error) {
           console.error("Error using Gemini API:", error);
           return {
@@ -610,9 +766,8 @@ export class ProcessingHelper {
             temperature: 0.2
           });
 
-          const responseText = (response.content[0] as { type: 'text', text: string }).text;
-          const jsonText = responseText.replace(/```json|```/g, '').trim();
-          problemInfo = JSON.parse(jsonText);
+          const responseText = (response.content[0] as { type: 'text', text: string }).text || '';
+          problemInfo = this.parseJsonFromText(responseText);
         } catch (error: any) {
           console.error("Error using Anthropic API:", error);
 
@@ -733,9 +888,9 @@ export class ProcessingHelper {
         });
       }
 
-      // Create prompt for solution generation
-      const promptText = `
-Generate a detailed solution for the following coding problem:
+  // Create prompt for solution generation
+  const promptText = `
+Generate a detailed solution for the following coding problem. Follow the exact markdown structure below using ### section headers.
 
 PROBLEM STATEMENT:
 ${problemInfo.problem_statement}
@@ -751,16 +906,26 @@ ${problemInfo.example_output || "No example output provided."}
 
 LANGUAGE: ${language}
 
-I need the response in the following format:
-1. Code: A clean, optimized implementation in ${language}
-2. Your Thoughts: A list of key insights and reasoning behind your approach
-3. Time complexity: O(X) with a detailed explanation (at least 2 sentences)
-4. Space complexity: O(X) with a detailed explanation (at least 2 sentences)
+YOUR RESPONSE MUST USE THESE SECTIONS (use the exact headers):
+### Explain the Problem
+- Briefly restate the problem in your own words, including goals, inputs/outputs, and key constraints.
 
-For complexity explanations, please be thorough. For example: "Time complexity: O(n) because we iterate through the array only once. This is optimal as we need to examine each element at least once to find the solution." or "Space complexity: O(n) because in the worst case, we store all elements in the hashmap. The additional space scales linearly with the input size."
+### Explain the Solution
+- Describe the approach step-by-step, why it works, important edge cases, and trade-offs. Keep it concise but clear.
 
-Your solution should be efficient, well-commented, and handle edge cases.
-`;
+### Your Thoughts
+- Bullet points of key insights and reasoning behind the approach.
+
+### Code
+Provide a clean, optimized implementation in ${language} using a fenced code block with the correct language tag.
+
+### Time complexity
+State Big-O (e.g., O(n log n)) and give a detailed explanation (at least 2 sentences) of why.
+
+### Space complexity
+State Big-O and give a detailed explanation (at least 2 sentences) of why.
+
+Be thorough but succinct. Ensure the code handles edge cases and is well-commented.`;
 
       let responseContent;
       
@@ -774,15 +939,22 @@ Your solution should be efficient, well-commented, and handle edge cases.
         }
         
         // Send to OpenAI API
-        const solutionResponse = await this.openaiClient.chat.completions.create({
-          model: config.solutionModel || "gpt-4o",
-          messages: [
-            { role: "system", content: "You are an expert coding interview assistant. Provide clear, optimal solutions with detailed explanations." },
-            { role: "user", content: promptText }
-          ],
+        const solutionMessages = [
+          { role: "system" as const, content: "You are an expert coding interview assistant. Provide clear, optimal solutions with detailed explanations." },
+          { role: "user" as const, content: promptText }
+        ];
+        this.logOpenAIRequest('solution', config.solutionModel || 'gpt-4o', {
+          messages: solutionMessages,
           max_tokens: 4000,
           temperature: 0.2
         });
+        const solutionResponse = await this.openaiClient.chat.completions.create({
+          model: config.solutionModel || "gpt-4o",
+          messages: solutionMessages,
+          max_tokens: 4000,
+          temperature: 0.2
+        });
+        this.logOpenAIResponse('solution', solutionResponse);
 
         responseContent = solutionResponse.choices[0].message.content;
       } else if (config.apiProvider === "gemini")  {
@@ -889,11 +1061,39 @@ Your solution should be efficient, well-commented, and handle edge cases.
       }
       
       // Extract parts from the response
+      console.log(`[DEBUG] Raw response content:`, responseContent.substring(0, 500) + '...');
       const codeMatch = responseContent.match(/```(?:\w+)?\s*([\s\S]*?)```/);
       const code = codeMatch ? codeMatch[1].trim() : responseContent;
       
+      // Extract "Explain the Problem" and "Explain the Solution" sections
+      const extractSection = (content: string, headerRegex: RegExp) => {
+        console.log(`[DEBUG] Extracting section with regex: ${headerRegex}`);
+        const sectionRegex = new RegExp(
+          `###\\s*(?:${headerRegex.source.replace(/^\/|\/[gimuy]*$/g, '')})\\s*\\n([\\s\\S]*?)(?=\\n###|$)`,
+          'i'
+        );
+        console.log(`[DEBUG] Final regex pattern: ${sectionRegex}`);
+        const match = content.match(sectionRegex);
+        console.log(`[DEBUG] Regex match result:`, match ? `Found match, groups: ${match.length}` : 'No match');
+        if (match && match[1]) {
+          console.log(`[DEBUG] Extracted content preview:`, match[1].substring(0, 200) + '...');
+          return match[1].trim();
+        }
+        return null;
+      };
+
+      const problemExplanation =
+        extractSection(responseContent, /Explain the Problem|Problem Explanation/i) ||
+        null;
+      const solutionExplanation =
+        extractSection(responseContent, /Explain the Solution|Solution Explanation/i) ||
+        null;
+
+      console.log(`[DEBUG] problemExplanation result:`, problemExplanation ? problemExplanation.substring(0, 100) + '...' : 'null');
+      console.log(`[DEBUG] solutionExplanation result:`, solutionExplanation ? solutionExplanation.substring(0, 100) + '...' : 'null');
+
       // Extract thoughts, looking for bullet points or numbered lists
-      const thoughtsRegex = /(?:Thoughts:|Key Insights:|Reasoning:|Approach:)([\s\S]*?)(?:Time complexity:|$)/i;
+      const thoughtsRegex = /(?:###\s*Your Thoughts|Thoughts:|Key Insights:|Reasoning:|Approach:)([\s\S]*?)(?:\n### |Time complexity:|$)/i;
       const thoughtsMatch = responseContent.match(thoughtsRegex);
       let thoughts: string[] = [];
       
@@ -913,13 +1113,14 @@ Your solution should be efficient, well-commented, and handle edge cases.
       }
       
       // Extract complexity information
-      const timeComplexityPattern = /Time complexity:?\s*([^\n]+(?:\n[^\n]+)*?)(?=\n\s*(?:Space complexity|$))/i;
-      const spaceComplexityPattern = /Space complexity:?\s*([^\n]+(?:\n[^\n]+)*?)(?=\n\s*(?:[A-Z]|$))/i;
+  const timeComplexityPattern = /###\s*Time complexity\s*\n([^\n]+(?:\n[^\n#]+)*?)(?=\n\s*###|$)/i;
+  const spaceComplexityPattern = /###\s*Space complexity\s*\n([^\n]+(?:\n[^\n#]+)*?)(?=\n\s*###|$)/i;
       
       let timeComplexity = "O(n) - Linear time complexity because we only iterate through the array once. Each element is processed exactly one time, and the hashmap lookups are O(1) operations.";
       let spaceComplexity = "O(n) - Linear space complexity because we store elements in the hashmap. In the worst case, we might need to store all elements before finding the solution pair.";
       
       const timeMatch = responseContent.match(timeComplexityPattern);
+      console.log(`[DEBUG] Time complexity match:`, timeMatch ? `Found: ${timeMatch[1].substring(0, 100)}...` : 'No match');
       if (timeMatch && timeMatch[1]) {
         timeComplexity = timeMatch[1].trim();
         if (!timeComplexity.match(/O\([^)]+\)/i)) {
@@ -935,6 +1136,7 @@ Your solution should be efficient, well-commented, and handle edge cases.
       }
       
       const spaceMatch = responseContent.match(spaceComplexityPattern);
+      console.log(`[DEBUG] Space complexity match:`, spaceMatch ? `Found: ${spaceMatch[1].substring(0, 100)}...` : 'No match');
       if (spaceMatch && spaceMatch[1]) {
         spaceComplexity = spaceMatch[1].trim();
         if (!spaceComplexity.match(/O\([^)]+\)/i)) {
@@ -953,8 +1155,17 @@ Your solution should be efficient, well-commented, and handle edge cases.
         code: code,
         thoughts: thoughts.length > 0 ? thoughts : ["Solution approach based on efficiency and readability"],
         time_complexity: timeComplexity,
-        space_complexity: spaceComplexity
+        space_complexity: spaceComplexity,
+        problem_explanation: problemExplanation,
+        solution_explanation: solutionExplanation
       };
+
+      console.log(`[DEBUG] Final formatted response:`, {
+        ...formattedResponse,
+        code: formattedResponse.code ? formattedResponse.code.substring(0, 100) + '...' : 'null',
+        problem_explanation: formattedResponse.problem_explanation ? formattedResponse.problem_explanation.substring(0, 100) + '...' : 'null',
+        solution_explanation: formattedResponse.solution_explanation ? formattedResponse.solution_explanation.substring(0, 100) + '...' : 'null'
+      });
 
       return { success: true, data: formattedResponse };
     } catch (error: any) {
@@ -1066,12 +1277,18 @@ If you include code examples, use proper markdown code blocks with language spec
           });
         }
 
+        this.logOpenAIRequest('debug', config.debuggingModel || 'gpt-4o', {
+          messages,
+          max_tokens: 4000,
+          temperature: 0.2
+        });
         const debugResponse = await this.openaiClient.chat.completions.create({
           model: config.debuggingModel || "gpt-4o",
           messages: messages,
           max_tokens: 4000,
           temperature: 0.2
         });
+        this.logOpenAIResponse('debug', debugResponse);
         
         debugContent = debugResponse.choices[0].message.content;
       } else if (config.apiProvider === "gemini")  {

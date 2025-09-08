@@ -1,6 +1,6 @@
 // ipcHandlers.ts
 
-import { ipcMain, shell, dialog } from "electron"
+import { ipcMain, shell, dialog, systemPreferences } from "electron"
 import { randomBytes } from "crypto"
 import { IIpcHandlerDeps } from "./main"
 import { configHelper } from "./ConfigHelper"
@@ -254,23 +254,20 @@ export function initializeIpcHandlers(deps: IIpcHandlerDeps): void {
   // Reset handlers
   ipcMain.handle("trigger-reset", () => {
     try {
-      // First cancel any ongoing requests
-      deps.processingHelper?.cancelOngoingRequests()
-
-      // Clear all queues immediately
-      deps.clearQueues()
-
-      // Reset view to queue
-      deps.setView("queue")
-
-      // Get main window and send reset events
-      const mainWindow = deps.getMainWindow()
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        // Send reset events in sequence
-        mainWindow.webContents.send("reset-view")
-        mainWindow.webContents.send("reset")
+      // Delegate full reset to main's resetAll implementation (includes voice + legacy events)
+      if (typeof (deps as any).resetAll === 'function') {
+        ;(deps as any).resetAll()
+      } else {
+        // Fallback to minimal original behavior if resetAll missing
+        deps.processingHelper?.cancelOngoingRequests()
+        deps.clearQueues()
+        deps.setView("queue")
+        const mainWindow = deps.getMainWindow()
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send("reset-view")
+          mainWindow.webContents.send("reset")
+        }
       }
-
       return { success: true }
     } catch (error) {
       console.error("Error triggering reset:", error)
@@ -346,6 +343,24 @@ export function initializeIpcHandlers(deps: IIpcHandlerDeps): void {
     } catch (error) {
       console.error("Error deleting last screenshot:", error)
       return { success: false, error: "Failed to delete last screenshot" }
+    }
+  })
+
+  // Permission / capability diagnostics for system audio capture (macOS focused)
+  ipcMain.handle('get-screen-permissions', () => {
+    try {
+      const platform = process.platform
+      let screenAccess: string | null = null
+      let micAccess: string | null = null
+      let cameraAccess: string | null = null
+      if (platform === 'darwin') {
+        try { screenAccess = systemPreferences.getMediaAccessStatus('screen') } catch {}
+        try { micAccess = systemPreferences.getMediaAccessStatus('microphone') } catch {}
+        try { cameraAccess = systemPreferences.getMediaAccessStatus('camera') } catch {}
+      }
+      return { success: true, platform, screenAccess, micAccess, cameraAccess, chromeVersion: process.versions.chrome, electron: process.versions.electron }
+    } catch (e: any) {
+      return { success: false, error: e?.message || String(e) }
     }
   })
 }

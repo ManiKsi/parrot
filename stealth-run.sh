@@ -24,6 +24,9 @@ mkdir -p ~/Library/Application\ Support/interview-coder-v1/temp
 mkdir -p ~/Library/Application\ Support/interview-coder-v1/cache
 mkdir -p ~/Library/Application\ Support/interview-coder-v1/screenshots
 mkdir -p ~/Library/Application\ Support/interview-coder-v1/extra_screenshots
+# Chromium session/cache subfolders used by Electron
+mkdir -p ~/Library/Application\ Support/interview-coder-v1/session/Shared\ Dictionary/cache
+mkdir -p ~/Library/Application\ Support/interview-coder-v1/session/Cache/Cache_Data
 
 echo "=== Step 2: Cleaning previous builds... ==="
 echo "Removing old build files to ensure a fresh start..."
@@ -38,7 +41,11 @@ echo "=== Step 4: Launching in stealth mode... ==="
 echo "Remember: Cmd+B to make it visible, Cmd+[ and Cmd+] to adjust opacity!"
 echo
 export NODE_ENV=production
-npx electron ./dist-electron/main.js &
+# Enable OpenAI request/response logging for debugging (see ProcessingHelper.ts)
+# SECURITY NOTE: Disables TLS verification for this Electron run to bypass
+# corporate proxy/self-signed cert issues. Use only for debugging.
+# Remove NODE_TLS_REJECT_UNAUTHORIZED=0 once proper CA trust is configured.
+ICODER_LOG_OPENAI=1 NODE_TLS_REJECT_UNAUTHORIZED=0 npx electron ./dist-electron/main.js &
 
 echo "App is now running invisibly! Press Cmd+B to make it visible."
 echo

@@ -23,6 +23,40 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
   const [isTooltipVisible, setIsTooltipVisible] = useState(false)
   const tooltipRef = useRef<HTMLDivElement>(null)
   const { showToast } = useToast()
+  // Voice Q&A state (passive indicator driven by global shortcut)
+  const [voiceMode, setVoiceMode] = useState<'idle' | 'listening' | 'processing'>('idle')
+  const [voicePhaseMsg, setVoicePhaseMsg] = useState<string>('')
+  const [voiceLastQuestion, setVoiceLastQuestion] = useState<string>('')
+  const [voiceLastAnswer, setVoiceLastAnswer] = useState<string>('')
+
+  // Subscribe to voice events if available
+  useEffect(() => {
+    const api: any = (window as any).electronAPI?.voice
+    if (!api) return
+
+    const offToggle = api.onToggle(() => {
+      setVoiceMode(m => m === 'idle' ? 'listening' : (m === 'listening' ? 'processing' : m))
+      if (voiceMode === 'idle') {
+        setVoicePhaseMsg('Listening…')
+      }
+    })
+    const offStatus = api.onStatus((s: { phase: string; message: string }) => {
+      setVoiceMode('processing')
+      setVoicePhaseMsg(s.message || 'Processing…')
+    })
+    const offResult = api.onResult((r: { question: string; answer: string }) => {
+      setVoiceMode('idle')
+      setVoicePhaseMsg('')
+      setVoiceLastQuestion(r.question)
+      setVoiceLastAnswer(r.answer)
+    })
+    const offErr = api.onError((_err: string) => {
+      setVoiceMode('idle')
+      setVoicePhaseMsg('')
+    })
+    return () => { offToggle && offToggle(); offStatus && offStatus(); offResult && offResult(); offErr && offErr() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Extract the repeated language selection logic into a separate function
   const extractLanguagesAndUpdate = (direction?: 'next' | 'prev') => {
@@ -193,6 +227,30 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
               </div>
             </div>
           )}
+
+          {/* Voice Q&A Indicator */}
+          <div
+            className="flex flex-col cursor-default rounded px-2 py-1.5 hover:bg-white/10 transition-colors min-w-[130px]"
+            title="Press Ctrl/Cmd+M to start/stop Voice Q&A"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] leading-none flex items-center gap-1">
+                <span className={`inline-block w-2 h-2 rounded-full ${voiceMode === 'listening' ? 'bg-amber-400 animate-pulse' : voiceMode === 'processing' ? 'bg-sky-400 animate-pulse' : 'bg-emerald-500'}`}></span>
+                Voice
+              </span>
+              <div className="flex gap-1">
+                <span className="bg-white/10 rounded-md px-1.5 py-1 text-[10px] leading-none text-white/70">{COMMAND_KEY}</span>
+                <span className="bg-white/10 rounded-md px-1.5 py-1 text-[10px] leading-none text-white/70">M</span>
+              </div>
+            </div>
+            <div className="mt-1 text-[10px] text-white/60 line-clamp-2 max-w-[180px]">
+              {voiceMode === 'listening' && 'Listening… speak your question'}
+              {voiceMode === 'processing' && (voicePhaseMsg || 'Processing…')}
+              {voiceMode === 'idle' && (
+                voiceLastQuestion ? `Q: ${voiceLastQuestion.slice(0,40)}…` : 'Ready'
+              )}
+            </div>
+          </div>
 
           {/* Separator */}
           <div className="mx-2 h-4 w-px bg-white/20" />

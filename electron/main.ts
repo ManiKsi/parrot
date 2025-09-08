@@ -1,4 +1,4 @@
-import { app, BrowserWindow, screen, shell, ipcMain } from "electron"
+import { app, BrowserWindow, screen, shell, ipcMain, globalShortcut, desktopCapturer } from "electron"
 import path from "path"
 import fs from "fs"
 import { initializeIpcHandlers } from "./ipcHandlers"
@@ -8,6 +8,7 @@ import { ShortcutsHelper } from "./shortcuts"
 import { initAutoUpdater } from "./autoUpdater"
 import { configHelper } from "./ConfigHelper"
 import * as dotenv from "dotenv"
+import { logger, logPhase, logDuration } from './logger'
 
 // Constants
 const isDev = process.env.NODE_ENV === "development"
@@ -34,6 +35,8 @@ const state = {
   view: "queue" as "queue" | "solutions" | "debug",
   problemInfo: null as any,
   hasDebugged: false,
+  // Voice Q&A (transient) state
+  voiceActive: false,
 
   // Processing events
   PROCESSING_EVENTS: {
@@ -47,9 +50,38 @@ const state = {
     INITIAL_SOLUTION_ERROR: "solution-error",
     DEBUG_START: "debug-start",
     DEBUG_SUCCESS: "debug-success",
-    DEBUG_ERROR: "debug-error"
+    DEBUG_ERROR: "debug-error",
+    RESET: "reset"
   } as const
 }
+
+// Voice IPC channel constants
+const VOICE_EVENTS = {
+  START_TOGGLE: 'voice:start-toggle',
+  STATUS: 'voice:status',
+  RESULT: 'voice:result',
+  PARTIAL: 'voice:partial',
+  ERROR: 'voice:error',
+  SAVE_AND_TRANSCRIBE: 'voice:save-and-transcribe',
+  SET_CONTEXT: 'voice:set-context',
+  GET_CONTEXT: 'voice:get-context',
+  SET_MODEL: 'voice:set-model',
+  GET_MODEL: 'voice:get-model',
+  GET_HISTORY: 'voice:get-history',
+  CLEAR_HISTORY: 'voice:clear-history',
+  SET_HISTORY_ENABLED: 'voice:set-history-enabled',
+  GET_HISTORY_ENABLED: 'voice:get-history-enabled'
+} as const
+
+// In-memory voice context (not yet persisted to config; can be extended later)
+let voiceContext: string = ''
+let voiceStreamingActive = false
+let voicePreferredModel: string | null = null
+interface VoiceTurn { q: string; a: string; ts: number }
+let voiceHistory: VoiceTurn[] = []
+let voiceHistoryEnabled = true
+const VOICE_HISTORY_MAX_TURNS = 15
+const VOICE_HISTORY_CHAR_LIMIT = 2500
 
 // Add interfaces for helper classes
 export interface IProcessingHelperDeps {
@@ -107,6 +139,7 @@ export interface IIpcHandlerDeps {
   moveWindowRight: () => void
   moveWindowUp: () => void
   moveWindowDown: () => void
+  resetAll: () => void
 }
 
 // Initialize helpers
@@ -206,6 +239,7 @@ async function createWindow(): Promise<void> {
   state.step = 60
   state.currentY = 50
 
+  const isMac = process.platform === 'darwin'
   const windowSettings: Electron.BrowserWindowConstructorOptions = {
     width: 800,
     height: 600,
@@ -220,7 +254,9 @@ async function createWindow(): Promise<void> {
       preload: isDev
         ? path.join(__dirname, "../dist-electron/preload.js")
         : path.join(__dirname, "preload.js"),
-      scrollBounce: true
+      scrollBounce: true,
+      // Use a separate session to avoid cache conflicts
+      partition: 'persist:main'
     },
     show: true,
     frame: false,
@@ -231,9 +267,10 @@ async function createWindow(): Promise<void> {
     backgroundColor: "#00000000",
     focusable: true,
     skipTaskbar: true,
-    type: "panel",
+    // NOTE: 'type: "panel"' on macOS can trigger: "NSWindow does not support nonactivating panel styleMask 0x80"
+    // which leads to an unresponsive window. We remove it and rely on alwaysOnTop + custom styling.
     paintWhenInitiallyHidden: true,
-    titleBarStyle: "hidden",
+    titleBarStyle: isMac ? 'hiddenInset' : 'hidden',
     enableLargerThanScreen: true,
     movable: true
   }
@@ -353,7 +390,12 @@ async function createWindow(): Promise<void> {
   console.log(`Initial opacity from config: ${savedOpacity}`);
   
   // Always make sure window is shown first
-  state.mainWindow.showInactive(); // Use showInactive for consistency
+  try {
+    // showInactive on macOS combined with former panel type can cause non-activating issues; prefer normal show
+    if (isMac) state.mainWindow.show(); else state.mainWindow.showInactive();
+  } catch {
+    state.mainWindow.show();
+  }
   
   if (savedOpacity <= 0.1) {
     console.log('Initial opacity too low, setting to 0 and hiding window');
@@ -502,6 +544,35 @@ function loadEnvVariables() {
   console.log("Environment variables loaded for open-source version")
 }
 
+// Cache clearing function to fix corrupted cache issues
+async function clearCorruptedCache() {
+  try {
+    const appDataPath = path.join(app.getPath('appData'), 'interview-coder-v1')
+    const sessionPath = path.join(appDataPath, 'session')
+    
+    const cacheDirectories = [
+      path.join(sessionPath, 'Shared Dictionary'),
+      path.join(sessionPath, 'Cache'),
+      path.join(sessionPath, 'GPUCache'),
+      path.join(sessionPath, 'Local Storage'),
+      path.join(sessionPath, 'Session Storage')
+    ]
+    
+    for (const cacheDir of cacheDirectories) {
+      if (fs.existsSync(cacheDir)) {
+        try {
+          fs.rmSync(cacheDir, { recursive: true, force: true })
+          console.log(`Cleared corrupted cache directory: ${cacheDir}`)
+        } catch (error) {
+          console.warn(`Could not clear cache directory ${cacheDir}:`, error)
+        }
+      }
+    }
+  } catch (error) {
+    console.warn('Error during cache cleanup:', error)
+  }
+}
+
 // Initialize application
 async function initializeApp() {
   try {
@@ -511,6 +582,23 @@ async function initializeApp() {
     const tempPath = path.join(appDataPath, 'temp')
     const cachePath = path.join(appDataPath, 'cache')
     
+    // Clean up problematic cache directories before creating new ones
+    const chromiumSharedDictCache = path.join(sessionPath, 'Shared Dictionary', 'cache')
+    const chromiumCacheData = path.join(sessionPath, 'Cache', 'Cache_Data')
+    
+    // Remove existing cache directories if they exist and are corrupted
+    const problematicDirs = [chromiumSharedDictCache, chromiumCacheData]
+    for (const dir of problematicDirs) {
+      if (fs.existsSync(dir)) {
+        try {
+          fs.rmSync(dir, { recursive: true, force: true })
+          console.log(`Removed corrupted cache directory: ${dir}`)
+        } catch (error) {
+          console.warn(`Could not remove cache directory ${dir}:`, error)
+        }
+      }
+    }
+    
     // Create directories if they don't exist
     for (const dir of [appDataPath, sessionPath, tempPath, cachePath]) {
       if (!fs.existsSync(dir)) {
@@ -518,10 +606,17 @@ async function initializeApp() {
       }
     }
     
+    // Set Electron app paths
     app.setPath('userData', appDataPath)
     app.setPath('sessionData', sessionPath)      
     app.setPath('temp', tempPath)
     app.setPath('cache', cachePath)
+    
+    // Add command line switches to handle cache issues
+    app.commandLine.appendSwitch('--disable-http-cache')
+    app.commandLine.appendSwitch('--disable-gpu-sandbox')
+    app.commandLine.appendSwitch('--no-sandbox')
+    app.commandLine.appendSwitch('--disable-web-security')
       
     loadEnvVariables()
     
@@ -557,10 +652,267 @@ async function initializeApp() {
           )
         ),
       moveWindowUp: () => moveWindowVertical((y) => y - state.step),
-      moveWindowDown: () => moveWindowVertical((y) => y + state.step)
+      moveWindowDown: () => moveWindowVertical((y) => y + state.step),
+      resetAll
     })
     await createWindow()
     state.shortcutsHelper?.registerGlobalShortcuts()
+
+    // Register global shortcut for push-to-talk Voice Q&A
+    try {
+      const shortcut = 'CommandOrControl+M'
+      if (globalShortcut.isRegistered(shortcut)) {
+        logger.info('voice', 'Re-registering shortcut (was registered)')
+        globalShortcut.unregister(shortcut)
+      }
+      const registered = globalShortcut.register(shortcut, () => {
+        logger.info('voice', 'Shortcut pressed', { shortcut })
+        state.mainWindow?.webContents.send(VOICE_EVENTS.START_TOGGLE)
+      })
+      if (registered) {
+        logger.info('voice', 'Global shortcut registered', { shortcut })
+      } else {
+        logger.warn('voice', 'Failed to register global shortcut', { shortcut })
+      }
+    } catch (e) {
+      logger.error('voice', 'Error registering global shortcut', { error: String(e) })
+    }
+
+    // Register global shortcut for full reset (screenshots, problem, voice history)
+    try {
+      const resetShortcut = 'CommandOrControl+R'
+      if (globalShortcut.isRegistered(resetShortcut)) {
+        globalShortcut.unregister(resetShortcut)
+      }
+      const registered = globalShortcut.register(resetShortcut, () => {
+        logger.info('app', 'Global reset shortcut invoked', { resetShortcut })
+        resetAll()
+      })
+      if (registered) {
+        logger.info('app', 'Global reset shortcut registered', { resetShortcut })
+      } else {
+        logger.warn('app', 'Failed to register global reset shortcut', { resetShortcut })
+      }
+    } catch (e) {
+      logger.error('app', 'Error registering reset shortcut', { error: String(e) })
+    }
+
+    // IPC handlers to set/get voice context
+    ipcMain.handle(VOICE_EVENTS.SET_CONTEXT, (_evt, ctx: string) => {
+      voiceContext = (ctx || '').slice(0, 4000) // limit size
+      logger.info('voice', 'Context updated', { length: voiceContext.length })
+      return { success: true }
+    })
+    ipcMain.handle(VOICE_EVENTS.GET_CONTEXT, () => ({ context: voiceContext }))
+    ipcMain.handle(VOICE_EVENTS.SET_MODEL, (_evt, model: string) => {
+      if (typeof model === 'string' && model.trim().length > 0) {
+        voicePreferredModel = model.trim()
+        logger.info('voice', 'Preferred model set', { model: voicePreferredModel })
+        return { success: true, model: voicePreferredModel }
+      }
+      return { success: false, error: 'Invalid model' }
+    })
+    ipcMain.handle(VOICE_EVENTS.GET_MODEL, () => ({ model: voicePreferredModel }))
+    ipcMain.handle(VOICE_EVENTS.GET_HISTORY, () => ({ history: voiceHistory }))
+    ipcMain.handle(VOICE_EVENTS.CLEAR_HISTORY, () => { voiceHistory = []; logger.info('voice', 'History cleared'); return { success: true } })
+    ipcMain.handle(VOICE_EVENTS.SET_HISTORY_ENABLED, (_evt, enabled: boolean) => {
+      voiceHistoryEnabled = !!enabled
+      logger.info('voice', 'History enabled set', { enabled: voiceHistoryEnabled })
+      return { success: true, enabled: voiceHistoryEnabled }
+    })
+    ipcMain.handle(VOICE_EVENTS.GET_HISTORY_ENABLED, () => ({ enabled: voiceHistoryEnabled }))
+
+    // Provide list of desktop (screen) sources for attempting system audio capture
+    ipcMain.handle('desktop-audio-sources', async () => {
+      try {
+        const sources = await desktopCapturer.getSources({ types: ['screen'], fetchWindowIcons: false, thumbnailSize: { width: 0, height: 0 } })
+        return { success: true, sources: sources.map(s => ({ id: s.id, name: s.name })) }
+      } catch (e: any) {
+        logger.error('voice', 'Failed to enumerate desktop audio sources', { error: String(e) })
+        return { success: false, error: String(e) }
+      }
+    })
+
+    // IPC handler: receive raw audio buffer -> save -> STT -> LLM answer (streaming)
+    ipcMain.handle(VOICE_EVENTS.SAVE_AND_TRANSCRIBE, async (_evt, args: { buffer: ArrayBuffer; model?: string; language?: string }) => {
+      if (voiceStreamingActive) {
+        logger.warn('voice', 'Voice request ignored, streaming already active')
+        return { success: false, error: 'Another voice request in progress' }
+      }
+      const startTs = Date.now()
+      logPhase('voice', 'RECEIVED_AUDIO', { bytes: args?.buffer ? (args as any).buffer.byteLength : 0 })
+      try {
+        if (!args?.buffer) throw new Error('No audio buffer provided')
+        const userDataDir = app.getPath('userData')
+        const voiceDir = path.join(userDataDir, 'voice')
+        if (!fs.existsSync(voiceDir)) fs.mkdirSync(voiceDir, { recursive: true })
+        // The renderer MediaRecorder produces webm chunks; save with .webm extension for downstream tools/ffmpeg
+        const audioPath = path.join(voiceDir, `rec-${startTs}.webm`)
+        fs.writeFileSync(audioPath, Buffer.from(args.buffer))
+        logger.debug('voice', 'Audio file written', { audioPath })
+
+        state.mainWindow?.webContents.send(VOICE_EVENTS.STATUS, { phase: 'stt', message: 'Transcribing…' })
+        logPhase('voice', 'STT_START')
+
+        const axios = (await import('axios')).default
+        // Dynamically load form-data correctly (its export is CommonJS default). Fallback to global FormData if available (Node 18+ / undici).
+        let FormDataCtor: any
+        try {
+          const mod: any = await import('form-data')
+          FormDataCtor = mod?.default || mod
+        } catch (importErr) {
+          FormDataCtor = (global as any).FormData
+          logger.warn('voice', 'form-data import failed, using global FormData fallback', { hasGlobal: !!FormDataCtor, error: String(importErr) })
+        }
+        if (!FormDataCtor) {
+          throw new Error('FormData constructor unavailable (install form-data or upgrade Node)')
+        }
+        const form = new FormDataCtor()
+        try {
+          form.append('file', fs.createReadStream(audioPath), { filename: path.basename(audioPath) })
+          form.append('language', args.language || 'en')
+        } catch (formErr) {
+          logger.error('voice', 'Failed building multipart form', { error: String(formErr) })
+          throw new Error('Failed to prepare transcription request')
+        }
+
+        let transcription = ''
+        let sttErrorDetails: any = null
+        try {
+          const sttStart = Date.now()
+            const headers = typeof form.getHeaders === 'function' ? form.getHeaders() : {}
+            const sttResp = await axios.post('http://127.0.0.1:17865/transcribe', form, { headers, timeout: 120000, maxContentLength: 25 * 1024 * 1024 })
+          logDuration('voice', 'STT_HTTP', sttStart)
+          transcription = sttResp.data?.text || sttResp.data?.transcription || sttResp.data?.result || ''
+          logger.info('voice', 'Transcription result', { transcriptionPreview: transcription.slice(0,200) })
+        } catch (err: any) {
+          sttErrorDetails = err?.response?.data || err?.message
+          logger.error('voice', 'STT failure', { error: sttErrorDetails })
+          throw new Error('Transcription failed')
+        }
+        if (!transcription) throw new Error('Empty transcription result')
+        logPhase('voice', 'STT_SUCCESS', { length: transcription.length })
+
+  state.mainWindow?.webContents.send(VOICE_EVENTS.STATUS, { phase: 'llm', message: 'Generating answer…', question: transcription })
+        logPhase('voice', 'LLM_START')
+
+        // Streaming model selection
+        const defaultModels = ['phi3:latest', 'mistral:latest', 'llama3', 'gemma3:12b-it-qat']
+        let candidateModels: string[] = []
+        if (args.model) {
+          candidateModels = [args.model]
+        } else if (voicePreferredModel) {
+          candidateModels = [voicePreferredModel]
+        }
+        for (const dm of defaultModels) {
+          if (!candidateModels.includes(dm)) candidateModels.push(dm)
+        }
+        logger.info('voice', 'Trying candidate models (streaming)', { candidates: candidateModels, contextLen: voiceContext.length, preferred: voicePreferredModel })
+        const systemPrefix = voiceContext ? `Interview Context (use this perspective when answering):\n${voiceContext.trim()}\n\n` : ''
+        // Build history section (oldest -> newest) within char limit
+        let historySection = ''
+        if (voiceHistoryEnabled && voiceHistory.length) {
+          const selected: VoiceTurn[] = []
+            let totalChars = 0
+            for (let i = voiceHistory.length - 1; i >= 0; i--) {
+              const turn = voiceHistory[i]
+              const snippet = `Q: ${turn.q}\nA: ${turn.a}\n\n`
+              const nextTotal = totalChars + snippet.length
+              if (nextTotal > VOICE_HISTORY_CHAR_LIMIT) break
+              selected.push(turn)
+              totalChars = nextTotal
+            }
+            selected.reverse()
+            if (selected.length) {
+              historySection = 'Previous exchanges (context):\n' + selected.map(t => `Q: ${t.q}\nA: ${t.a}`).join('\n\n') + '\n\n'
+            }
+        }
+        const promptBase = `${systemPrefix}${historySection}Question: ${transcription}\n\nAnswer:`
+        const requestId = `${startTs}-${Math.random().toString(36).slice(2,8)}`
+        // Inform renderer about the new question so it can render immediately
+        state.mainWindow?.webContents.send(VOICE_EVENTS.STATUS, { phase: 'llm', message: 'Generating answer…', question: transcription, requestId })
+  let usedModel: string | null = null
+  let lastErr: any = null
+  let answer = ''
+        voiceStreamingActive = true
+        for (const m of candidateModels) {
+          try {
+            const llmStart = Date.now()
+            // Use fetch streaming API
+            const controller = new AbortController()
+            const bodyPayload = JSON.stringify({ model: m, prompt: promptBase, stream: true })
+            const resp = await fetch('http://localhost:11434/api/generate', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: bodyPayload,
+              signal: controller.signal
+            })
+            if (!resp.ok || !resp.body) {
+              throw new Error(`HTTP ${resp.status}`)
+            }
+            logDuration('voice', 'LLM_HTTP', llmStart)
+            usedModel = m
+            const reader = resp.body.getReader()
+            const textDecoder = new TextDecoder()
+            let chunkIndex = 0
+            while (true) {
+              const { done, value } = await reader.read()
+              if (done) break
+              const txt = textDecoder.decode(value, { stream: true })
+              const lines = txt.split('\n').filter(l => l.trim())
+              for (const line of lines) {
+                try {
+                  const json = JSON.parse(line)
+                  if (json.response) {
+                    const delta = json.response
+                    answer += delta
+                    chunkIndex++
+                    if (chunkIndex % 5 === 1) {
+                      logger.debug('voice', 'Partial chunk', { model: m, chars: answer.length, chunks: chunkIndex })
+                    }
+                    state.mainWindow?.webContents.send(VOICE_EVENTS.PARTIAL, { requestId, delta, answer, model: m })
+                  }
+                  if (json.done) {
+                    logPhase('voice', 'LLM_SUCCESS', { length: answer.length, chunks: chunkIndex, model: m })
+                  }
+                } catch (parseErr) {
+                  logger.warn('voice', 'Failed to parse streaming line', { lineSnippet: line.slice(0,120) })
+                }
+              }
+            }
+            break // success with model m
+          } catch (err: any) {
+            lastErr = err
+            logger.warn('voice', 'Streaming model attempt failed', { model: m, error: err?.message })
+            usedModel = null
+            answer = ''
+            continue
+          }
+        }
+        voiceStreamingActive = false
+        if (!usedModel) {
+          logger.error('voice', 'All streaming candidate models failed', { candidates: candidateModels, error: lastErr?.message })
+          throw new Error('LLM generation failed for all models')
+        }
+        if (!answer) answer = 'No answer generated.'
+        // Update history after successful completion
+        if (voiceHistoryEnabled) {
+          voiceHistory.push({ q: transcription, a: answer, ts: Date.now() })
+          if (voiceHistory.length > VOICE_HISTORY_MAX_TURNS) {
+            voiceHistory = voiceHistory.slice(-VOICE_HISTORY_MAX_TURNS)
+          }
+        }
+        state.mainWindow?.webContents.send(VOICE_EVENTS.RESULT, { question: transcription, answer, model: usedModel, requestId })
+        logDuration('voice', 'VOICE_PIPELINE_TOTAL', startTs)
+        return { success: true, question: transcription, answer, model: usedModel, requestId }
+      } catch (error: any) {
+        const msg = error?.message || 'Voice processing failed'
+        logger.error('voice', 'Pipeline error', { msg, stack: error?.stack })
+        state.mainWindow?.webContents.send(VOICE_EVENTS.ERROR, msg)
+        voiceStreamingActive = false
+        return { success: false, error: msg }
+      }
+    })
 
     // Initialize auto-updater regardless of environment
     initAutoUpdater()
@@ -600,9 +952,14 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on("window-all-closed", () => {
     if (process.platform !== "darwin") {
+      console.log('Application is quitting, performing cleanup...')
       app.quit()
       state.mainWindow = null
     }
+  })
+  
+  app.on("before-quit", async () => {
+    console.log('Application is about to quit, performing final cleanup...')
   })
 }
 
@@ -662,6 +1019,31 @@ async function takeScreenshot(): Promise<string> {
   )
 }
 
+// Full reset function (invoked by shortcut or IPC) to clear all transient state
+function resetAll(): void {
+  try {
+    logger.info('app', 'Performing full reset')
+    // Cancel any processing
+    state.processingHelper?.cancelOngoingRequests()
+    // Clear screenshot queues & problem info
+    clearQueues()
+    setHasDebugged(false)
+    setProblemInfo(null)
+    // Preserve voiceContext per user request, but clear conversation history
+    voiceHistory = []
+    voiceStreamingActive = false
+    // Notify renderer views
+    if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+      state.mainWindow.webContents.send('reset-view') // legacy event some UI listeners use
+      state.mainWindow.webContents.send(state.PROCESSING_EVENTS.RESET)
+      // Dedicated voice reset event so renderer can fully hide panel
+      state.mainWindow.webContents.send('voice:reset')
+    }
+  } catch (e) {
+    logger.error('app', 'Error during resetAll', { error: String(e) })
+  }
+}
+
 async function getImagePreview(filepath: string): Promise<string> {
   return state.screenshotHelper?.getImagePreview(filepath) || ""
 }
@@ -692,6 +1074,7 @@ export {
   hideMainWindow,
   showMainWindow,
   toggleMainWindow,
+  resetAll,
   setWindowDimensions,
   moveWindowHorizontal,
   moveWindowVertical,
@@ -711,4 +1094,7 @@ export {
   getHasDebugged
 }
 
-app.whenReady().then(initializeApp)
+app.whenReady().then(async () => {
+  await clearCorruptedCache()
+  await initializeApp()
+})

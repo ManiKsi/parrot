@@ -237,6 +237,63 @@ const electronAPI = {
     }
   },
   deleteLastScreenshot: () => ipcRenderer.invoke("delete-last-screenshot")
+  ,
+  // Capture lifecycle events (renderer can listen directly to hide overlays during screenshots)
+  onCapturePrepare: (cb: () => void) => {
+    const fn = () => cb();
+    ipcRenderer.on('capture:prepare', fn);
+    return () => ipcRenderer.removeListener('capture:prepare', fn);
+  },
+  onCaptureRestore: (cb: () => void) => {
+    const fn = () => cb();
+    ipcRenderer.on('capture:restore', fn);
+    return () => ipcRenderer.removeListener('capture:restore', fn);
+  },
+  // Voice Q&A API
+  voice: {
+    onToggle: (cb: () => void) => {
+      const fn = () => cb()
+      ipcRenderer.on('voice:start-toggle', fn)
+      return () => ipcRenderer.removeListener('voice:start-toggle', fn)
+    },
+    onStatus: (cb: (s: { phase: string; message: string }) => void) => {
+      const fn = (_: any, data: any) => cb(data)
+      ipcRenderer.on('voice:status', fn)
+      return () => ipcRenderer.removeListener('voice:status', fn)
+    },
+    onResult: (cb: (r: { question: string; answer: string }) => void) => {
+      const fn = (_: any, data: any) => cb(data)
+      ipcRenderer.on('voice:result', fn)
+      return () => ipcRenderer.removeListener('voice:result', fn)
+    },
+    onPartial: (cb: (p: { delta: string; answer: string; model?: string; requestId?: string }) => void) => {
+      const fn = (_: any, data: any) => cb(data)
+      ipcRenderer.on('voice:partial', fn)
+      return () => ipcRenderer.removeListener('voice:partial', fn)
+    },
+    onError: (cb: (err: string) => void) => {
+      const fn = (_: any, data: any) => cb(data)
+      ipcRenderer.on('voice:error', fn)
+      return () => ipcRenderer.removeListener('voice:error', fn)
+    },
+    submitRecording: (buffer: ArrayBuffer, model?: string, language?: string) => ipcRenderer.invoke('voice:save-and-transcribe', { buffer, model, language }),
+    setContext: (text: string) => ipcRenderer.invoke('voice:set-context', text),
+    getContext: () => ipcRenderer.invoke('voice:get-context'),
+    setModel: (model: string) => ipcRenderer.invoke('voice:set-model', model),
+    getModel: () => ipcRenderer.invoke('voice:get-model'),
+    getHistory: () => ipcRenderer.invoke('voice:get-history'),
+    clearHistory: () => ipcRenderer.invoke('voice:clear-history'),
+    setHistoryEnabled: (enabled: boolean) => ipcRenderer.invoke('voice:set-history-enabled', enabled),
+    getHistoryEnabled: () => ipcRenderer.invoke('voice:get-history-enabled'),
+    onReset: (cb: () => void) => {
+      const fn = () => cb();
+      ipcRenderer.on('voice:reset', fn);
+      return () => ipcRenderer.removeListener('voice:reset', fn);
+    }
+  },
+  getDesktopAudioSources: () => ipcRenderer.invoke('desktop-audio-sources')
+  ,
+  getScreenPermissions: () => ipcRenderer.invoke('get-screen-permissions')
 }
 
 // Before exposing the API
