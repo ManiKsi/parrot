@@ -356,6 +356,7 @@ export class ProcessingHelper {
     if (!mainWindow) return
 
     const config = configHelper.loadConfig();
+    const directMode = !!config.directSolveMode; // new mode flag
     
     // First verify we have a valid AI client
     if (config.apiProvider === "openai" && !this.openaiClient) {
@@ -441,7 +442,13 @@ export class ProcessingHelper {
           throw new Error("Failed to load screenshot data");
         }
 
-        const result = await this.processScreenshotsHelper(validScreenshots, signal)
+        let result;
+        if (directMode) {
+          console.log('[DirectSolve] Using single-pass direct interpretation flow');
+          result = await this.processScreenshotsDirectHelper(validScreenshots as any, signal);
+        } else {
+          result = await this.processScreenshotsHelper(validScreenshots as any, signal)
+        }
 
         if (!result.success) {
           console.log("Processing failed:", result.error)
@@ -866,6 +873,185 @@ export class ProcessingHelper {
         success: false, 
         error: error.message || "Failed to process screenshots. Please try again." 
       };
+    }
+  }
+
+  /**
+   * New single-pass direct solve flow: given screenshots that may contain a problem description, partial code,
+   * buggy code, high-level instructions, or even noisy/gibberish text, infer the most plausible task and return
+   * a complete solution object matching the structure expected by the renderer (re-using SOLUTION_SUCCESS event).
+   */
+  private async processScreenshotsDirectHelper(
+    screenshots: Array<{ path: string; data: string }>,
+    signal: AbortSignal
+  ) {
+    try {
+      const config = configHelper.loadConfig();
+      const languagePref = await this.getLanguage();
+      const mainWindow = this.deps.getMainWindow();
+      const imageDataList = screenshots.map(s => s.data);
+
+      if (mainWindow) {
+        mainWindow.webContents.send('processing-status', { message: 'Interpreting screenshots (direct mode)...', progress: 15 });
+      }
+
+      const systemInstruction = `You are an advanced code assistant. You will receive one or more screenshots that may include any of the following:
+- A programming / algorithm problem description
+- Partially written code that must be completed
+- Code containing bugs that must be fixed
+- High-level natural language task instructions
+- Mixture of the above or even some irrelevant / noisy text
+
+Your job (single pass):
+1. Infer and clearly state the actual TASK you will solve.
+2. Identify key requirements / constraints / hidden assumptions (even if implicit).
+3. If code is present, detect language. If unclear, default to ${languagePref}.
+4. Provide a robust, production-quality final solution (completed or fixed code) in ONE primary code block.
+5. Include an Explanation section (problem understanding + reasoning + approach) and a Validation section (edge cases & test ideas).
+6. Provide Time complexity and Space complexity with Big-O plus justification.
+7. Provide 4-6 concise bullet "Key Insights".
+
+Output MUST use these markdown section headers exactly:
+### Inferred Task
+### Key Requirements
+### Explanation
+### Key Insights
+### Code
+### Validation & Tests
+### Time complexity
+### Space complexity
+
+Be decisive—do not ask the user questions. If screenshots are low quality, still make the best reasonable inference. Always produce code.`;
+
+      const userIntro = `Interpret and solve directly from these screenshot(s). If partial/buggy code is shown, produce the corrected full version. Default language: ${languagePref}.`;
+
+      let responseContent: string = '';
+
+      // Provider-specific handling (with images in first request) similar to extraction but richer prompt
+      if (config.apiProvider === 'openai') {
+        if (!this.openaiClient) {
+          this.initializeAIClient();
+          if (!this.openaiClient) {
+            return { success: false, error: 'OpenAI API key not configured or invalid.' };
+          }
+        }
+        const messages: any[] = [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: [
+            { type: 'text', text: userIntro },
+            ...imageDataList.map(d => ({ type: 'image_url', image_url: { url: `data:image/png;base64,${d}` } }))
+          ] }
+        ];
+        this.logOpenAIRequest('direct', config.solutionModel || 'gpt-4o', { messages, max_tokens: 4000, temperature: 0.25 });
+        const resp = await this.openaiClient.chat.completions.create({
+          model: config.solutionModel || 'gpt-4o',
+          messages,
+          max_tokens: 4000,
+          temperature: 0.25
+        });
+        this.logOpenAIResponse('direct', resp);
+        responseContent = resp.choices[0].message.content || '';
+      } else if (config.apiProvider === 'gemini') {
+        if (!this.geminiApiKey) {
+          return { success: false, error: 'Gemini API key not configured.' };
+        }
+        try {
+          const geminiMessages = [
+            {
+              role: 'user',
+              parts: [
+                { text: systemInstruction + '\n\n' + userIntro },
+                ...imageDataList.map(d => ({ inlineData: { mimeType: 'image/png', data: d } }))
+              ]
+            }
+          ];
+          const response = await (axios as any).default.post(
+            `https://generativelanguage.googleapis.com/v1beta/models/${config.solutionModel || 'gemini-2.0-flash'}:generateContent?key=${this.geminiApiKey}`,
+            { contents: geminiMessages, generationConfig: { temperature: 0.25, maxOutputTokens: 4000 } },
+            { signal }
+          );
+          const data = response.data as any;
+          responseContent = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        } catch (e) {
+          console.error('[DirectSolve][Gemini] error', e);
+          return { success: false, error: 'Gemini direct solve failed. Try again or switch provider.' };
+        }
+      } else if (config.apiProvider === 'anthropic') {
+        if (!this.anthropicClient) {
+          return { success: false, error: 'Anthropic API key not configured.' };
+        }
+        try {
+          const messages: AnthropicMessage[] = [
+            {
+              role: 'user',
+              content: [
+                { type: 'text', text: systemInstruction + '\n\n' + userIntro },
+                ...imageDataList.map(d => ({
+                  type: 'image' as const,
+                  source: { type: 'base64' as const, media_type: 'image/png' as const, data: d }
+                }))
+              ]
+            }
+          ];
+          const response = await this.anthropicClient.messages.create({
+            model: config.solutionModel || 'claude-3-7-sonnet-20250219',
+            max_tokens: 4000,
+            temperature: 0.25,
+            messages: messages as any // cast to satisfy SDK expected type
+          });
+          responseContent = (response.content[0] as any)?.text || '';
+        } catch (e: any) {
+          console.error('[DirectSolve][Claude] error', e);
+          return { success: false, error: 'Claude direct solve failed. Possibly rate limit or input too large.' };
+        }
+      }
+
+      if (!responseContent) {
+        return { success: false, error: 'Empty response from model.' };
+      }
+
+      if (mainWindow) {
+        mainWindow.webContents.send('processing-status', { message: 'Formatting solution...', progress: 80 });
+      }
+
+      // Reuse section extraction logic (Time/Space etc.)
+      const codeMatch = responseContent.match(/```(?:[a-zA-Z0-9+_-]+)?\s*([\s\S]*?)```/);
+      const code = codeMatch ? codeMatch[1].trim() : responseContent;
+
+      const section = (header: string) => {
+        const rgx = new RegExp(`###\\s*${header.replace(/[-/\\^$*+?.()|[\]{}]/g, r => `\\${r}`)}\\s*\n([\\s\\S]*?)(?=\n###|$)`, 'i');
+        const m = responseContent.match(rgx); return m && m[1] ? m[1].trim() : null;
+      };
+      const inferredTask = section('Inferred Task');
+      const requirements = section('Key Requirements');
+      const explanation = section('Explanation');
+      const insightsBlock = section('Key Insights') || '';
+      const validation = section('Validation & Tests');
+      const timeComplexity = section('Time complexity') || 'O(n) - (Model did not specify; inferred default)';
+      const spaceComplexity = section('Space complexity') || 'O(1) - (Model did not specify; inferred default)';
+      const thoughts = insightsBlock.split(/\n+/).map(l => l.replace(/^[-*•\d.\s]+/, '').trim()).filter(Boolean).slice(0, 8);
+
+      const formatted = {
+        code,
+        problem_explanation: inferredTask,
+        solution_explanation: explanation,
+        thoughts: thoughts.length ? thoughts : ['Direct solve insights not parsed'],
+        time_complexity: timeComplexity,
+        space_complexity: spaceComplexity,
+        // Extra fields for renderer (non-breaking)
+        direct_mode: true,
+        requirements,
+        validation
+      };
+
+      // In direct mode we do not emit PROBLEM_EXTRACTED, only final success
+      return { success: true, data: formatted };
+    } catch (error: any) {
+      if ((axios as any).isCancel?.(error)) {
+        return { success: false, error: 'Processing was canceled by the user.' };
+      }
+      console.error('[DirectSolve] error', error);
+      return { success: false, error: error.message || 'Direct solve failed.' };
     }
   }
 

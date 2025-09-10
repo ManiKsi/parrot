@@ -62,6 +62,8 @@ const VOICE_EVENTS = {
   RESULT: 'voice:result',
   PARTIAL: 'voice:partial',
   ERROR: 'voice:error',
+  ABORT: 'voice:abort',
+  ABORTED: 'voice:aborted',
   SAVE_AND_TRANSCRIBE: 'voice:save-and-transcribe',
   SET_CONTEXT: 'voice:set-context',
   GET_CONTEXT: 'voice:get-context',
@@ -76,6 +78,9 @@ const VOICE_EVENTS = {
 // In-memory voice context (not yet persisted to config; can be extended later)
 let voiceContext: string = ''
 let voiceStreamingActive = false
+let voiceAbortRequested = false
+let currentLLMAbortController: AbortController | null = null
+let currentSttAbortController: AbortController | null = null
 let voicePreferredModel: string | null = null
 interface VoiceTurn { q: string; a: string; ts: number }
 let voiceHistory: VoiceTurn[] = []
@@ -697,6 +702,34 @@ async function initializeApp() {
       logger.error('app', 'Error registering reset shortcut', { error: String(e) })
     }
 
+    // Register global shortcut to toggle Direct Solve Mode
+    try {
+      const directModeShortcut = 'CommandOrControl+D'
+      if (globalShortcut.isRegistered(directModeShortcut)) {
+        globalShortcut.unregister(directModeShortcut)
+      }
+      const registered = globalShortcut.register(directModeShortcut, () => {
+        try {
+          const cfg = configHelper.loadConfig()
+          const newVal = !cfg.directSolveMode
+          configHelper.updateConfig({ directSolveMode: newVal })
+          logger.info('app', 'Direct Solve Mode toggled via shortcut', { directSolveMode: newVal })
+          if (state.mainWindow && !state.mainWindow.isDestroyed()) {
+            state.mainWindow.webContents.send('direct-mode-updated', { enabled: newVal })
+          }
+        } catch (err) {
+          logger.error('app', 'Failed toggling direct solve mode', { error: String(err) })
+        }
+      })
+      if (registered) {
+        logger.info('app', 'Direct Solve Mode shortcut registered', { directModeShortcut })
+      } else {
+        logger.warn('app', 'Failed to register Direct Solve Mode shortcut', { directModeShortcut })
+      }
+    } catch (e) {
+      logger.error('app', 'Error registering Direct Solve Mode shortcut', { error: String(e) })
+    }
+
     // IPC handlers to set/get voice context
     ipcMain.handle(VOICE_EVENTS.SET_CONTEXT, (_evt, ctx: string) => {
       voiceContext = (ctx || '').slice(0, 4000) // limit size
@@ -739,6 +772,8 @@ async function initializeApp() {
         logger.warn('voice', 'Voice request ignored, streaming already active')
         return { success: false, error: 'Another voice request in progress' }
       }
+      voiceAbortRequested = false
+      voiceStreamingActive = true // Mark active immediately so abort can apply during STT
       const startTs = Date.now()
       logPhase('voice', 'RECEIVED_AUDIO', { bytes: args?.buffer ? (args as any).buffer.byteLength : 0 })
       try {
@@ -750,6 +785,13 @@ async function initializeApp() {
         const audioPath = path.join(voiceDir, `rec-${startTs}.webm`)
         fs.writeFileSync(audioPath, Buffer.from(args.buffer))
         logger.debug('voice', 'Audio file written', { audioPath })
+
+        if (voiceAbortRequested) {
+          logger.info('voice', 'Abort requested before STT began')
+          voiceStreamingActive = false
+          state.mainWindow?.webContents.send(VOICE_EVENTS.ABORTED)
+          return { success: false, aborted: true }
+        }
 
         state.mainWindow?.webContents.send(VOICE_EVENTS.STATUS, { phase: 'stt', message: 'Transcribing…' })
         logPhase('voice', 'STT_START')
@@ -780,20 +822,37 @@ async function initializeApp() {
         let sttErrorDetails: any = null
         try {
           const sttStart = Date.now()
-            const headers = typeof form.getHeaders === 'function' ? form.getHeaders() : {}
-            const sttResp = await axios.post('http://127.0.0.1:17865/transcribe', form, { headers, timeout: 120000, maxContentLength: 25 * 1024 * 1024 })
+          const headers = typeof form.getHeaders === 'function' ? form.getHeaders() : {}
+          currentSttAbortController = new AbortController()
+          const sttResp = await axios.post('http://127.0.0.1:17865/transcribe', form, { headers, timeout: 120000, maxContentLength: 25 * 1024 * 1024, signal: currentSttAbortController.signal as any })
           logDuration('voice', 'STT_HTTP', sttStart)
           transcription = sttResp.data?.text || sttResp.data?.transcription || sttResp.data?.result || ''
           logger.info('voice', 'Transcription result', { transcriptionPreview: transcription.slice(0,200) })
         } catch (err: any) {
+          if (voiceAbortRequested) {
+            logger.info('voice', 'STT aborted by user')
+            currentSttAbortController = null
+            voiceStreamingActive = false
+            state.mainWindow?.webContents.send(VOICE_EVENTS.ABORTED)
+            return { success: false, aborted: true }
+          }
           sttErrorDetails = err?.response?.data || err?.message
           logger.error('voice', 'STT failure', { error: sttErrorDetails })
           throw new Error('Transcription failed')
+        } finally {
+          currentSttAbortController = null
         }
         if (!transcription) throw new Error('Empty transcription result')
         logPhase('voice', 'STT_SUCCESS', { length: transcription.length })
 
-  state.mainWindow?.webContents.send(VOICE_EVENTS.STATUS, { phase: 'llm', message: 'Generating answer…', question: transcription })
+        if (voiceAbortRequested) {
+          logger.info('voice', 'Abort requested after STT, before LLM')
+          voiceStreamingActive = false
+          state.mainWindow?.webContents.send(VOICE_EVENTS.ABORTED)
+          return { success: false, aborted: true }
+        }
+
+        state.mainWindow?.webContents.send(VOICE_EVENTS.STATUS, { phase: 'llm', message: 'Generating answer…', question: transcription })
         logPhase('voice', 'LLM_START')
 
         // Streaming model selection
@@ -808,40 +867,47 @@ async function initializeApp() {
           if (!candidateModels.includes(dm)) candidateModels.push(dm)
         }
         logger.info('voice', 'Trying candidate models (streaming)', { candidates: candidateModels, contextLen: voiceContext.length, preferred: voicePreferredModel })
-        const systemPrefix = voiceContext ? `Interview Context (use this perspective when answering):\n${voiceContext.trim()}\n\n` : ''
-        // Build history section (oldest -> newest) within char limit
-        let historySection = ''
+        // Build chat-style message array for Ollama /api/chat
+        // system role: dedicated system prompt (voiceContext) instead of embedding in user prompt
+        const messages: { role: string; content: string }[] = []
+        if (voiceContext && voiceContext.trim()) {
+          messages.push({ role: 'system', content: voiceContext.trim() })
+        }
+        // Append trimmed history within char limit (oldest to newest)
         if (voiceHistoryEnabled && voiceHistory.length) {
           const selected: VoiceTurn[] = []
-            let totalChars = 0
-            for (let i = voiceHistory.length - 1; i >= 0; i--) {
-              const turn = voiceHistory[i]
-              const snippet = `Q: ${turn.q}\nA: ${turn.a}\n\n`
-              const nextTotal = totalChars + snippet.length
-              if (nextTotal > VOICE_HISTORY_CHAR_LIMIT) break
-              selected.push(turn)
-              totalChars = nextTotal
-            }
-            selected.reverse()
-            if (selected.length) {
-              historySection = 'Previous exchanges (context):\n' + selected.map(t => `Q: ${t.q}\nA: ${t.a}`).join('\n\n') + '\n\n'
-            }
+          let totalChars = 0
+          for (let i = voiceHistory.length - 1; i >= 0; i--) {
+            const turn = voiceHistory[i]
+            // Estimate size if added as two messages
+            const pairLen = turn.q.length + turn.a.length + 10
+            if (totalChars + pairLen > VOICE_HISTORY_CHAR_LIMIT) break
+            selected.push(turn)
+            totalChars += pairLen
+          }
+          selected.reverse()
+          for (const t of selected) {
+            messages.push({ role: 'user', content: t.q })
+            messages.push({ role: 'assistant', content: t.a })
+          }
         }
-        const promptBase = `${systemPrefix}${historySection}Question: ${transcription}\n\nAnswer:`
-        const requestId = `${startTs}-${Math.random().toString(36).slice(2,8)}`
+        // Current user question
+        messages.push({ role: 'user', content: transcription })
+  let requestId: string | null = `${startTs}-${Math.random().toString(36).slice(2,8)}`
         // Inform renderer about the new question so it can render immediately
-        state.mainWindow?.webContents.send(VOICE_EVENTS.STATUS, { phase: 'llm', message: 'Generating answer…', question: transcription, requestId })
+  state.mainWindow?.webContents.send(VOICE_EVENTS.STATUS, { phase: 'llm', message: 'Generating answer…', question: transcription, requestId })
   let usedModel: string | null = null
   let lastErr: any = null
   let answer = ''
-        voiceStreamingActive = true
+  // voiceStreamingActive already set earlier
         for (const m of candidateModels) {
           try {
             const llmStart = Date.now()
-            // Use fetch streaming API
+            // Use chat streaming API (/api/chat) with structured messages
             const controller = new AbortController()
-            const bodyPayload = JSON.stringify({ model: m, prompt: promptBase, stream: true })
-            const resp = await fetch('http://localhost:11434/api/generate', {
+            currentLLMAbortController = controller
+            const bodyPayload = JSON.stringify({ model: m, messages, stream: true })
+            const resp = await fetch('http://localhost:11434/api/chat', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: bodyPayload,
@@ -855,7 +921,13 @@ async function initializeApp() {
             const reader = resp.body.getReader()
             const textDecoder = new TextDecoder()
             let chunkIndex = 0
+            let lastAnswerLength = 0
             while (true) {
+              if (voiceAbortRequested) {
+                controller.abort()
+                logger.info('voice', 'Abort requested during streaming loop')
+                break
+              }
               const { done, value } = await reader.read()
               if (done) break
               const txt = textDecoder.decode(value, { stream: true })
@@ -863,14 +935,16 @@ async function initializeApp() {
               for (const line of lines) {
                 try {
                   const json = JSON.parse(line)
-                  if (json.response) {
-                    const delta = json.response
-                    answer += delta
+                  // Chat streaming format: json.message?.content incremental pieces, json.done flag at end
+                  if (json.message?.content) {
+                    const deltaContent = json.message.content
+                    answer += deltaContent
                     chunkIndex++
                     if (chunkIndex % 5 === 1) {
                       logger.debug('voice', 'Partial chunk', { model: m, chars: answer.length, chunks: chunkIndex })
                     }
-                    state.mainWindow?.webContents.send(VOICE_EVENTS.PARTIAL, { requestId, delta, answer, model: m })
+                    state.mainWindow?.webContents.send(VOICE_EVENTS.PARTIAL, { requestId, delta: deltaContent, answer, model: m })
+                    lastAnswerLength = answer.length
                   }
                   if (json.done) {
                     logPhase('voice', 'LLM_SUCCESS', { length: answer.length, chunks: chunkIndex, model: m })
@@ -880,7 +954,12 @@ async function initializeApp() {
                 }
               }
             }
-            break // success with model m
+            if (voiceAbortRequested) {
+              usedModel = null
+              answer = ''
+              break
+            }
+            break // success with model m (not aborted)
           } catch (err: any) {
             lastErr = err
             logger.warn('voice', 'Streaming model attempt failed', { model: m, error: err?.message })
@@ -888,8 +967,15 @@ async function initializeApp() {
             answer = ''
             continue
           }
+          if (voiceAbortRequested) break
         }
+        currentLLMAbortController = null
         voiceStreamingActive = false
+        if (voiceAbortRequested) {
+          logger.info('voice', 'Voice processing aborted by user')
+          state.mainWindow?.webContents.send(VOICE_EVENTS.ABORTED, { requestId })
+          return { success: false, aborted: true, requestId }
+        }
         if (!usedModel) {
           logger.error('voice', 'All streaming candidate models failed', { candidates: candidateModels, error: lastErr?.message })
           throw new Error('LLM generation failed for all models')
@@ -908,10 +994,38 @@ async function initializeApp() {
       } catch (error: any) {
         const msg = error?.message || 'Voice processing failed'
         logger.error('voice', 'Pipeline error', { msg, stack: error?.stack })
+        if (voiceAbortRequested) {
+          // Already handled abort event earlier, just ensure cleanup
+          voiceStreamingActive = false
+          currentLLMAbortController = null
+          currentSttAbortController = null
+          return { success: false, aborted: true }
+        }
         state.mainWindow?.webContents.send(VOICE_EVENTS.ERROR, msg)
         voiceStreamingActive = false
+        currentLLMAbortController = null
+        currentSttAbortController = null
         return { success: false, error: msg }
       }
+    })
+
+    // Abort current voice processing (transcription or generation)
+    ipcMain.handle(VOICE_EVENTS.ABORT, () => {
+      if (!voiceStreamingActive) {
+        return { success: false, error: 'No active voice processing' }
+      }
+      if (voiceAbortRequested) {
+        return { success: true, already: true }
+      }
+      voiceAbortRequested = true
+      if (currentLLMAbortController) {
+        try { currentLLMAbortController.abort() } catch {}
+      }
+      if (currentSttAbortController) {
+        try { currentSttAbortController.abort() } catch {}
+      }
+      logger.info('voice', 'Abort requested by renderer')
+      return { success: true }
     })
 
     // Initialize auto-updater regardless of environment

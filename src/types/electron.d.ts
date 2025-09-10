@@ -56,6 +56,8 @@ export interface ElectronAPI {
   // New methods for OpenAI integration
   getConfig: () => Promise<{ apiKey: string; model: string }>
   updateConfig: (config: { apiKey?: string; model?: string }) => Promise<boolean>
+    updateConfig: (config: { apiKey?: string; model?: string; directSolveMode?: boolean }) => Promise<boolean>
+    onDirectModeUpdated?: (cb: (data: { enabled: boolean }) => void) => () => void
   checkApiKey: () => Promise<boolean>
   validateApiKey: (apiKey: string) => Promise<{ valid: boolean; error?: string }>
   openLink: (url: string) => void

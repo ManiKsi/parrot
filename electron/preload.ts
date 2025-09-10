@@ -238,6 +238,11 @@ const electronAPI = {
   },
   deleteLastScreenshot: () => ipcRenderer.invoke("delete-last-screenshot")
   ,
+  onDirectModeUpdated: (cb: (data: { enabled: boolean }) => void) => {
+    const fn = (_: any, data: any) => cb(data)
+    ipcRenderer.on('direct-mode-updated', fn)
+    return () => ipcRenderer.removeListener('direct-mode-updated', fn)
+  },
   // Capture lifecycle events (renderer can listen directly to hide overlays during screenshots)
   onCapturePrepare: (cb: () => void) => {
     const fn = () => cb();
@@ -276,7 +281,13 @@ const electronAPI = {
       ipcRenderer.on('voice:error', fn)
       return () => ipcRenderer.removeListener('voice:error', fn)
     },
+    onAborted: (cb: (data?: { requestId?: string }) => void) => {
+      const fn = (_: any, data: any) => cb(data)
+      ipcRenderer.on('voice:aborted', fn)
+      return () => ipcRenderer.removeListener('voice:aborted', fn)
+    },
     submitRecording: (buffer: ArrayBuffer, model?: string, language?: string) => ipcRenderer.invoke('voice:save-and-transcribe', { buffer, model, language }),
+    abortProcessing: () => ipcRenderer.invoke('voice:abort'),
     setContext: (text: string) => ipcRenderer.invoke('voice:set-context', text),
     getContext: () => ipcRenderer.invoke('voice:get-context'),
     setModel: (model: string) => ipcRenderer.invoke('voice:set-model', model),

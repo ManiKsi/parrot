@@ -20,6 +20,8 @@ const formatTime = (ms: number) => {
 }
 
 const VoiceOverlay: React.FC = () => {
+  // Central settings dialog now owns model/context/history. Keep inline advanced controls hidden.
+  const SHOW_INLINE_VOICE_SETTINGS = false
   const [state, setState] = useState<VoiceState>({ mode: 'idle' })
   // User-visible panel flag: only becomes true once user starts voice interaction
   const [showPanel, setShowPanel] = useState(false)
@@ -36,6 +38,8 @@ const VoiceOverlay: React.FC = () => {
   const chunksRef = useRef<Blob[]>([])
   const startTsRef = useRef<number>(0)
   const timerRef = useRef<number | null>(null)
+  const conversationRef = useRef<HTMLDivElement | null>(null)
+  const [autoScrollPinned, setAutoScrollPinned] = useState(true)
 
   const clearTimer = () => { if (timerRef.current) { window.clearInterval(timerRef.current); timerRef.current = null } }
 
@@ -78,6 +82,12 @@ const VoiceOverlay: React.FC = () => {
       mediaRecorderRef.current.stop()
       mediaRecorderRef.current.stream.getTracks().forEach(t => t.stop())
     }
+  }, [state.mode])
+
+  const abortProcessing = useCallback(async () => {
+    if (state.mode !== 'processing') return
+    try { await (window as any).electronAPI.voice.abortProcessing?.() } catch {}
+    setState({ mode: 'idle' })
   }, [state.mode])
 
   // Toggle from global shortcut
@@ -132,7 +142,11 @@ const VoiceOverlay: React.FC = () => {
     const offError = (window as any).electronAPI.voice.onError((err: string) => {
       setState({ mode: 'idle', error: err })
     })
-    return () => { offStatus && offStatus(); offResult && offResult(); offPartial && offPartial(); offError && offError() }
+    const offAborted = (window as any).electronAPI.voice.onAborted((data?: any) => {
+      setState({ mode: 'idle', question: state.question, answer: undefined, requestId: undefined })
+      currentRequestIdRef.current = null
+    })
+    return () => { offStatus && offStatus(); offResult && offResult(); offPartial && offPartial(); offError && offError(); offAborted && offAborted() }
   }, [])
 
   // Listen for global reset to clear local voice UI state
@@ -180,6 +194,19 @@ const VoiceOverlay: React.FC = () => {
     })()
   }, [])
 
+  // Listen for external settings updates (SettingsDialog -> custom event)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail: any = (e as CustomEvent).detail || {}
+      if (typeof detail.model === 'string') setModel(detail.model)
+      if (typeof detail.context === 'string') setContext(detail.context)
+      if (typeof detail.historyEnabled === 'boolean') setHistoryEnabled(detail.historyEnabled)
+      if (detail.historyCleared) setHistory([])
+    }
+    window.addEventListener('voice-settings-updated', handler as EventListener)
+    return () => window.removeEventListener('voice-settings-updated', handler as EventListener)
+  }, [])
+
   // Debounced auto-save of context
   useEffect(() => {
     if (!contextDirty) return
@@ -215,6 +242,29 @@ const VoiceOverlay: React.FC = () => {
     return () => { offPrep && offPrep(); offRestore && offRestore() }
   }, [])
 
+  // Auto-scroll pinned logic – keep bottom locked during streaming unless user scrolls up
+  useEffect(() => {
+    const el = conversationRef.current
+    if (!el) return
+    if (!autoScrollPinned) return
+    if (state.mode === 'processing') {
+      el.scrollTop = el.scrollHeight
+    } else {
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+    }
+  }, [state.answer, state.mode, history.length, autoScrollPinned])
+
+  useEffect(() => {
+    const el = conversationRef.current
+    if (!el) return
+    const onScroll = () => {
+      const atBottom = (el.scrollHeight - (el.scrollTop + el.clientHeight)) < 24
+      setAutoScrollPinned(atBottom)
+    }
+    el.addEventListener('scroll', onScroll, { passive: true })
+    return () => el.removeEventListener('scroll', onScroll)
+  }, [])
+
   // Visibility logic: only show overlay when active (listening/processing) or user has at least one Q/A in history
   const hasConversation = history.length > 0 || state.question || state.answer
   const shouldShow = showPanel && (state.mode !== 'idle' || hasConversation)
@@ -226,7 +276,11 @@ const VoiceOverlay: React.FC = () => {
       </div>
       {indicator && (
         <div className="text-amber-300 text-[11px] flex items-center gap-2">
-          <span className={state.mode === 'listening' ? 'animate-pulse' : ''}>{indicator}</span>
+          <span
+            onClick={state.mode === 'processing' ? abortProcessing : undefined}
+            className={`${state.mode === 'listening' ? 'animate-pulse' : ''} ${state.mode === 'processing' ? 'cursor-pointer underline decoration-dotted' : ''}`}
+            title={state.mode === 'processing' ? 'Click to abort processing' : ''}
+          >{indicator}{state.mode === 'processing' && ' (click to abort)'}</span>
           {state.mode === 'listening' && <span className="text-amber-400/80">{formatTime(elapsed)}</span>}
         </div>
       )}
@@ -238,7 +292,7 @@ const VoiceOverlay: React.FC = () => {
       )}
       <div className="space-y-1">
         <div className="text-[11px] text-zinc-400 uppercase tracking-wide">Conversation</div>
-        <div className="max-h-44 overflow-auto flex flex-col gap-2 pr-1 custom-scrollbar">
+        <div ref={conversationRef} className="max-h-44 overflow-auto flex flex-col gap-2 pr-1 custom-scrollbar">
           {history.length === 0 && state.question && state.answer === undefined && (
             <div className="text-zinc-500 text-[11px]">First question in progress…</div>
           )}
@@ -271,64 +325,66 @@ const VoiceOverlay: React.FC = () => {
           <div className="text-[10px] text-zinc-500 uppercase tracking-wide">Model: {state.model}</div>
         )}
       </div>
-      <div className="space-y-1">
-        <details className="group">
-          <summary className="cursor-pointer text-[11px] text-zinc-400 group-open:text-zinc-200 select-none">History Settings</summary>
-          <div className="mt-1 flex items-center gap-2 text-[11px]">
-            <label className="flex items-center gap-1 select-none">
-              <input
-                type="checkbox"
-                checked={historyEnabled}
-                onChange={async e => {
-                  const en = e.target.checked
-                  setHistoryEnabled(en)
-                  try { await (window as any).electronAPI.voice.setHistoryEnabled(en) } catch {}
+      {SHOW_INLINE_VOICE_SETTINGS && (
+        <div className="space-y-1">
+          <details className="group">
+            <summary className="cursor-pointer text-[11px] text-zinc-400 group-open:text-zinc-200 select-none">History Settings</summary>
+            <div className="mt-1 flex items-center gap-2 text-[11px]">
+              <label className="flex items-center gap-1 select-none">
+                <input
+                  type="checkbox"
+                  checked={historyEnabled}
+                  onChange={async e => {
+                    const en = e.target.checked
+                    setHistoryEnabled(en)
+                    try { await (window as any).electronAPI.voice.setHistoryEnabled(en) } catch {}
+                  }}
+                /> Enabled
+              </label>
+              <button
+                className="px-2 py-0.5 bg-zinc-700/60 rounded hover:bg-zinc-600/70 disabled:opacity-50"
+                disabled={!history.length}
+                onClick={async () => {
+                  try { await (window as any).electronAPI.voice.clearHistory(); setHistory([]) } catch {}
                 }}
-              /> Enabled
-            </label>
-            <button
-              className="px-2 py-0.5 bg-zinc-700/60 rounded hover:bg-zinc-600/70 disabled:opacity-50"
-              disabled={!history.length}
-              onClick={async () => {
-                try { await (window as any).electronAPI.voice.clearHistory(); setHistory([]) } catch {}
-              }}
-            >Clear All</button>
-            <div className="text-[10px] text-zinc-500">Turns: {history.length}</div>
-          </div>
-        </details>
-        <details className="group">
-          <summary className="cursor-pointer text-[11px] text-zinc-400 group-open:text-zinc-200 select-none">Model (on the fly)</summary>
-          <div className="mt-1 flex items-center gap-2">
-            <input
-              className="flex-1 bg-zinc-800/60 border border-zinc-700/50 rounded px-2 py-1 text-[11px] focus:outline-none focus:ring-1 focus:ring-amber-400/60"
-              placeholder="e.g. phi3:latest"
-              value={model}
-              onChange={e => setModel(e.target.value)}
+              >Clear All</button>
+              <div className="text-[10px] text-zinc-500">Turns: {history.length}</div>
+            </div>
+          </details>
+          <details className="group">
+            <summary className="cursor-pointer text-[11px] text-zinc-400 group-open:text-zinc-200 select-none">Model (on the fly)</summary>
+            <div className="mt-1 flex items-center gap-2">
+              <input
+                className="flex-1 bg-zinc-800/60 border border-zinc-700/50 rounded px-2 py-1 text-[11px] focus:outline-none focus:ring-1 focus:ring-amber-400/60"
+                placeholder="e.g. phi3:latest"
+                value={model}
+                onChange={e => setModel(e.target.value)}
+              />
+              <button
+                className="px-2 py-1 bg-amber-600/80 hover:bg-amber-500 text-[11px] rounded disabled:opacity-50"
+                disabled={!model || modelSaving}
+                onClick={async () => {
+                  setModelSaving(true)
+                  try {
+                    await (window as any).electronAPI.voice.setModel(model)
+                  } finally { setModelSaving(false) }
+                }}
+              >{modelSaving ? 'Saving…' : 'Apply'}</button>
+            </div>
+            <div className="mt-1 text-[10px] text-zinc-500 leading-snug">If set, this model is tried first before fallbacks (phi3, mistral, llama3, gemma).</div>
+          </details>
+          <details className="group">
+            <summary className="cursor-pointer text-[11px] text-zinc-400 group-open:text-zinc-200 select-none">Context (influences answers)</summary>
+            <textarea
+              className="mt-1 w-full h-16 bg-zinc-800/60 border border-zinc-700/50 rounded p-1 text-[11px] focus:outline-none focus:ring-1 focus:ring-amber-400/60 resize-y"
+              value={context}
+              placeholder="e.g. You are an AWS interviewer focusing on scalability and cost optimization."
+              onChange={e => { setContext(e.target.value); setContextDirty(true) }}
             />
-            <button
-              className="px-2 py-1 bg-amber-600/80 hover:bg-amber-500 text-[11px] rounded disabled:opacity-50"
-              disabled={!model || modelSaving}
-              onClick={async () => {
-                setModelSaving(true)
-                try {
-                  await (window as any).electronAPI.voice.setModel(model)
-                } finally { setModelSaving(false) }
-              }}
-            >{modelSaving ? 'Saving…' : 'Apply'}</button>
-          </div>
-          <div className="mt-1 text-[10px] text-zinc-500 leading-snug">If set, this model is tried first before fallbacks (phi3, mistral, llama3, gemma).</div>
-        </details>
-        <details className="group">
-          <summary className="cursor-pointer text-[11px] text-zinc-400 group-open:text-zinc-200 select-none">Context (influences answers)</summary>
-          <textarea
-            className="mt-1 w-full h-16 bg-zinc-800/60 border border-zinc-700/50 rounded p-1 text-[11px] focus:outline-none focus:ring-1 focus:ring-amber-400/60 resize-y"
-            value={context}
-            placeholder="e.g. You are an AWS interviewer focusing on scalability and cost optimization."
-            onChange={e => { setContext(e.target.value); setContextDirty(true) }}
-          />
-          {contextDirty && <div className="text-[10px] text-amber-400/80">Saving…</div>}
-        </details>
-      </div>
+            {contextDirty && <div className="text-[10px] text-amber-400/80">Saving…</div>}
+          </details>
+        </div>
+      )}
       {state.mode === 'idle' && !state.question && !state.error && (
         <div className="text-zinc-400 text-[11px]">Press shortcut to start recording a question.</div>
       )}

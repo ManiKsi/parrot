@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Dialog,
   DialogTrigger,
@@ -184,8 +184,89 @@ export function SettingsDialog({ open: externalOpen, onOpenChange }: SettingsDia
   const [extractionModel, setExtractionModel] = useState("gpt-4o");
   const [solutionModel, setSolutionModel] = useState("gpt-4o");
   const [debuggingModel, setDebuggingModel] = useState("gpt-4o");
+  const [directSolveMode, setDirectSolveMode] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const { showToast } = useToast();
+
+  // Voice settings state
+  const [voiceModel, setVoiceModel] = useState("")
+  const [voiceModelSaving, setVoiceModelSaving] = useState(false)
+  const [voiceContext, setVoiceContext] = useState("")
+  const [voiceContextDirty, setVoiceContextDirty] = useState(false)
+  const [voiceHistoryEnabled, setVoiceHistoryEnabled] = useState(true)
+  const [voiceHistoryCount, setVoiceHistoryCount] = useState(0)
+  const voiceSaveTimeoutRef = useRef<number | null>(null)
+  // Simple domain selector + managed prompt template
+  const languageOptions = [
+    'Java','JavaScript','TypeScript','Python','Go','Rust','C#','C++','Kotlin','Scala','Swift','SQL','AWS','Azure','GCP','DevOps','Docker','Kubernetes','React','Node.js','Spring','Hibernate'
+  ]
+  const [voiceDomain, setVoiceDomain] = useState('Java')
+
+  const generateManagedPrompt = (domain: string) => {
+    // Classification guides nuance without hardcoding specific domain directives
+    const frameworkSet = new Set(['Spring','React','Node.js','Hibernate','Kubernetes','Docker'])
+    const languageSet = new Set(['Java','JavaScript','TypeScript','Python','Go','Rust','C#','C++','Kotlin','Scala','Swift','SQL'])
+    const platformSet = new Set(['AWS','Azure','GCP','DevOps'])
+    let domainGuidance: string
+    if (frameworkSet.has(domain)) {
+      domainGuidance = `Framework Focus: give definition + lifecycle/IOC or runtime mechanics + minimal idiomatic code (annotations/config) + when to use.`
+    } else if (languageSet.has(domain)) {
+      domainGuidance = `Language Focus: give definition + core API/construct + minimal idiomatic snippet in ${domain}.`
+    } else if (platformSet.has(domain)) {
+      domainGuidance = `Platform Focus: describe service/component choice + architecture + concise CLI/config snippet when relevant.`
+    } else {
+      domainGuidance = `Domain Focus: ground explanation in ${domain} best practices and implementation specifics.`
+    }
+
+    return (
+      `SYSTEM INSTRUCTIONS:\n` +
+      `Primary Domain: ${domain}\n` +
+      `Answer Style: interview, concise, authoritative, neutral, no filler.\n` +
+      `Scope: All questions are software engineering technical.\n` +
+      `${domainGuidance}\n` +
+      `Concept Handling:\n` +
+      `- Single-word or short noun phrase (≤3 words): treat as "Explain and show minimal ${domain} implementation".\n` +
+      `- Provide one direct Answer if unambiguous; use Options only for materially distinct meanings.\n` +
+      `- Always prefer minimal current, idiomatic style (annotations/config for frameworks; latest stable syntax for languages).\n` +
+      `Disambiguation: If ambiguous, output 2–3 labeled Options (Option 1:/Option 2:/Option 3:).\n` +
+      `Malformed Input: Repair silently and proceed.\n` +
+      `Conflicts: If user wording conflicts with reality, respond with corrected concept directly.\n` +
+      `Length: 1–3 sentences (or per option).\n` +
+      `Code: One concise code block (<12 lines) if implementation applies; no superfluous comments.\n` +
+      `Format:\nAnswer: <direct answer OR Option 1:/Option 2:/Option 3:>\nOptional Addendum: [Note: <single caveat>] only if materially useful (edge/pitfall/performance).\n` +
+      `Forbidden: apologies, preambles, rhetorical questions, marketing tone, unrelated tangents, clarification requests unless blocking.`
+    )
+  }
+
+  const isManagedTemplate = (txt: string) => /SYSTEM INSTRUCTIONS:/i.test(txt) && /Answer Style: interview/i.test(txt)
+
+  // Initialize / parse existing domain from stored context
+  useEffect(() => {
+    if (!open) return
+    if (!voiceContext) {
+      const p = generateManagedPrompt(voiceDomain)
+      setVoiceContext(p)
+      setVoiceContextDirty(true)
+      return
+    }
+    const m = voiceContext.match(/Primary Domain:\s*(.+)/i)
+    if (m && m[1]) {
+      const found = m[1].trim()
+      if (languageOptions.includes(found)) setVoiceDomain(found)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
+
+  // When domain changes, update prompt if still managed (user hasn't heavily customized it)
+  useEffect(() => {
+    if (!open) return
+    if (!voiceContext || isManagedTemplate(voiceContext)) {
+      const p = generateManagedPrompt(voiceDomain)
+      setVoiceContext(p)
+      setVoiceContextDirty(true)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [voiceDomain])
 
   // Sync with external open state
   useEffect(() => {
@@ -213,6 +294,7 @@ export function SettingsDialog({ open: externalOpen, onOpenChange }: SettingsDia
         extractionModel?: string;
         solutionModel?: string;
         debuggingModel?: string;
+        directSolveMode?: boolean;
       }
 
       window.electronAPI
@@ -223,6 +305,7 @@ export function SettingsDialog({ open: externalOpen, onOpenChange }: SettingsDia
           setExtractionModel(config.extractionModel || "gpt-4o");
           setSolutionModel(config.solutionModel || "gpt-4o");
           setDebuggingModel(config.debuggingModel || "gpt-4o");
+          setDirectSolveMode(!!config.directSolveMode);
         })
         .catch((error: unknown) => {
           console.error("Failed to load config:", error);
@@ -231,6 +314,29 @@ export function SettingsDialog({ open: externalOpen, onOpenChange }: SettingsDia
         .finally(() => {
           setIsLoading(false);
         });
+
+      // Load voice settings (best-effort; ignore failures quietly)
+      (async () => {
+        try {
+          const voiceApi = (window as any).electronAPI?.voice
+          if (!voiceApi) return
+          try {
+            const ctxRes = await voiceApi.getContext(); if (ctxRes?.context) setVoiceContext(ctxRes.context)
+          } catch {}
+          try {
+            const modelRes = await voiceApi.getModel(); if (modelRes?.model) setVoiceModel(modelRes.model)
+          } catch {}
+            try {
+              const he = await voiceApi.getHistoryEnabled(); if (typeof he?.enabled === 'boolean') setVoiceHistoryEnabled(he.enabled)
+            } catch {}
+          try {
+            const hist = await voiceApi.getHistory(); if (hist?.history) setVoiceHistoryCount(hist.history.length)
+          } catch {}
+        } catch (e) {
+          // Non-fatal; keep silent to avoid noisy UX
+          console.warn('[SettingsDialog] Voice settings load failed', e)
+        }
+      })()
     }
   }, [open, showToast]);
 
@@ -263,6 +369,7 @@ export function SettingsDialog({ open: externalOpen, onOpenChange }: SettingsDia
         extractionModel,
         solutionModel,
         debuggingModel,
+        directSolveMode,
       });
       
       if (result) {
@@ -282,6 +389,45 @@ export function SettingsDialog({ open: externalOpen, onOpenChange }: SettingsDia
     }
   };
 
+  // Debounced auto-save for voice context
+  useEffect(() => {
+    if (!open) return
+    if (!voiceContextDirty) return
+    if (voiceSaveTimeoutRef.current) window.clearTimeout(voiceSaveTimeoutRef.current)
+    voiceSaveTimeoutRef.current = window.setTimeout(async () => {
+      try {
+        await (window as any).electronAPI?.voice?.setContext(voiceContext)
+        setVoiceContextDirty(false)
+        try { window.dispatchEvent(new CustomEvent('voice-settings-updated', { detail: { context: voiceContext } })) } catch {}
+      } catch (e) {
+        console.warn('[SettingsDialog] Failed to save voice context', e)
+      }
+    }, 700)
+  }, [voiceContext, voiceContextDirty, open])
+
+  // Helpers for voice settings actions
+  const applyVoiceModel = async () => {
+    if (!voiceModel) return
+    setVoiceModelSaving(true)
+    try {
+      await (window as any).electronAPI?.voice?.setModel(voiceModel)
+      try { window.dispatchEvent(new CustomEvent('voice-settings-updated', { detail: { model: voiceModel } })) } catch {}
+    } finally { setVoiceModelSaving(false) }
+  }
+
+  const toggleVoiceHistory = async (enabled: boolean) => {
+    setVoiceHistoryEnabled(enabled)
+    try { await (window as any).electronAPI?.voice?.setHistoryEnabled(enabled) } finally {
+      try { window.dispatchEvent(new CustomEvent('voice-settings-updated', { detail: { historyEnabled: enabled } })) } catch {}
+    }
+  }
+
+  const clearVoiceHistory = async () => {
+    try { await (window as any).electronAPI?.voice?.clearHistory(); setVoiceHistoryCount(0) } finally {
+      try { window.dispatchEvent(new CustomEvent('voice-settings-updated', { detail: { historyCleared: true } })) } catch {}
+    }
+  }
+
   // Mask API key for display
   const maskApiKey = (key: string) => {
     if (!key || key.length < 10) return "";
@@ -299,15 +445,18 @@ export function SettingsDialog({ open: externalOpen, onOpenChange }: SettingsDia
         className="sm:max-w-md bg-black border border-white/10 text-white settings-dialog"
         style={{
           position: 'fixed',
+            // Center positioning
           top: '50%',
           left: '50%',
           transform: 'translate(-50%, -50%)',
+            // Sizing
           width: 'min(450px, 90vw)',
           height: 'auto',
           minHeight: '400px',
           maxHeight: '90vh',
           overflowY: 'auto',
-          zIndex: 9999,
+            // Ensure this stays above voice overlay (z-[9999]) and any toasts (z-[100])
+          zIndex: 12000,
           margin: 0,
           padding: '20px',
           transition: 'opacity 0.25s ease, transform 0.25s ease',
@@ -322,6 +471,22 @@ export function SettingsDialog({ open: externalOpen, onOpenChange }: SettingsDia
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-4">
+          {/* Mode Selection */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-white flex items-center gap-2">
+              <input
+                type="checkbox"
+                className="accent-white"
+                checked={directSolveMode}
+                onChange={(e) => setDirectSolveMode(e.target.checked)}
+              />
+              Direct Solve Mode (single-pass)
+            </label>
+            <p className="text-xs text-white/60 leading-relaxed">
+              When enabled, the app will skip the two-step extraction -&gt; solution flow and directly interpret and solve
+              whatever is in the screenshots (problem description, partial code, buggy code, or high-level task) in one pass.
+            </p>
+          </div>
           {/* API Provider Selection */}
           <div className="space-y-2">
             <label className="text-sm font-medium text-white">API Provider</label>
@@ -562,6 +727,96 @@ export function SettingsDialog({ open: externalOpen, onOpenChange }: SettingsDia
                 </div>
               );
             })}
+          </div>
+
+          {/* Voice Q&A Settings */}
+          <div className="space-y-3 mt-8">
+            <label className="text-sm font-medium text-white flex items-center gap-2">
+              Voice Q&A Settings
+              <span className="text-[10px] px-1 py-0.5 rounded bg-white/10 text-white/60">Experimental</span>
+            </label>
+            <p className="text-xs text-white/60 -mt-2">Configure default voice assistant behavior. These settings affect voice recording sessions (shortcut: Ctrl/Cmd+M).</p>
+
+            {/* Voice Model */}
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-white/80">Preferred Voice Model (override)</label>
+              <div className="flex gap-2">
+                <Input
+                  value={voiceModel}
+                  onChange={(e) => setVoiceModel(e.target.value)}
+                  placeholder="e.g. phi3:latest or gpt-4o-mini"
+                  className="bg-black/50 border-white/10 text-white text-xs"
+                />
+                <Button
+                  disabled={!voiceModel || voiceModelSaving}
+                  onClick={applyVoiceModel}
+                  className="text-xs px-3"
+                >{voiceModelSaving ? 'Saving...' : 'Apply'}</Button>
+              </div>
+              <p className="text-[10px] text-white/50 leading-snug">If set, this model will be tried first for voice answers before internal fallbacks (phi3, mistral, llama3, gemma).</p>
+            </div>
+
+            {/* Voice Context */}
+            <div className="space-y-1">
+              <label className="text-xs font-medium text-white/80">Voice Assistant Context</label>
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <label className="text-[10px] uppercase tracking-wide text-white/50">Primary Domain / Technology</label>
+                <select
+                  value={voiceDomain}
+                  onChange={e=>setVoiceDomain(e.target.value)}
+                  className="bg-black/50 border border-white/10 rounded px-2 py-1 text-[11px] focus:outline-none focus:ring-1 focus:ring-white/30"
+                >
+                  {languageOptions.map(l=> <option key={l} value={l}>{l}</option>)}
+                </select>
+                <span className="text-[10px] text-white/40">Changing domain updates prompt if not customized.</span>
+                <button
+                  type="button"
+                  onClick={() => { const p = generateManagedPrompt(voiceDomain); setVoiceContext(p); setVoiceContextDirty(true) }}
+                  className="ml-auto px-2 py-1 rounded bg-amber-500/80 hover:bg-amber-400 text-black text-[10px] font-medium"
+                >Regenerate</button>
+              </div>
+              <textarea
+                value={voiceContext}
+                onChange={(e) => { setVoiceContext(e.target.value); setVoiceContextDirty(true) }}
+                placeholder="e.g. You are a senior engineer focusing on clear, concise explanations."
+                className="w-full h-20 bg-black/50 border border-white/10 rounded-md p-2 text-xs focus:outline-none focus:ring-1 focus:ring-white/30 resize-y"
+              />
+              <div className="flex items-center justify-between">
+                {voiceContextDirty ? (
+                  <span className="text-[10px] text-amber-300">Saving…</span>
+                ) : (
+                  <span className="text-[10px] text-white/40">Auto-saved locally</span>
+                )}
+                {voiceContext && (
+                  <button
+                    onClick={() => { setVoiceContext(''); setVoiceContextDirty(true) }}
+                    className="text-[10px] text-white/50 hover:text-white/70 underline"
+                  >Clear</button>
+                )}
+              </div>
+            </div>
+
+            {/* History Controls */}
+            <div className="space-y-2">
+              <label className="text-xs font-medium text-white/80">Conversation History</label>
+              <div className="flex items-center gap-3 text-xs">
+                <label className="flex items-center gap-1 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={voiceHistoryEnabled}
+                    onChange={(e) => toggleVoiceHistory(e.target.checked)}
+                  />
+                  <span className="text-white/80">Enabled</span>
+                </label>
+                <Button
+                  variant="outline"
+                  disabled={!voiceHistoryCount}
+                  onClick={clearVoiceHistory}
+                  className="h-7 px-2 text-xs border-white/10 hover:bg-white/5"
+                >Clear ({voiceHistoryCount})</Button>
+              </div>
+              <p className="text-[10px] text-white/40 leading-snug">History is stored only on your device and improves follow-up questions. Disable for a stateless assistant.</p>
+            </div>
           </div>
         </div>
         <DialogFooter className="flex justify-between sm:justify-between">

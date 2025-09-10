@@ -28,6 +28,15 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
   const [voicePhaseMsg, setVoicePhaseMsg] = useState<string>('')
   const [voiceLastQuestion, setVoiceLastQuestion] = useState<string>('')
   const [voiceLastAnswer, setVoiceLastAnswer] = useState<string>('')
+  // Voice input/source quick menu state
+  const [voiceMenuOpen, setVoiceMenuOpen] = useState(false)
+  const voiceMenuRef = useRef<HTMLDivElement | null>(null)
+  const [inputMode, setInputMode] = useState<'mic' | 'system' | 'mixed'>('mic')
+  const [availableMics, setAvailableMics] = useState<MediaDeviceInfo[]>([])
+  const [selectedMicId, setSelectedMicId] = useState<string>('')
+  const [desktopSources, setDesktopSources] = useState<{ id: string; name: string }[]>([])
+  const [selectedDesktopSourceId, setSelectedDesktopSourceId] = useState<string>('')
+  const [meterGain, setMeterGain] = useState<number>(1.0)
 
   // Subscribe to voice events if available
   useEffect(() => {
@@ -57,6 +66,57 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
     return () => { offToggle && offToggle(); offStatus && offStatus(); offResult && offResult(); offErr && offErr() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Load persisted meter gain and enumerate devices/sources when menu opens
+  useEffect(() => {
+    if (!voiceMenuOpen) return
+    // Meter gain
+    try {
+      const stored = localStorage.getItem('voice.meterGain')
+      if (stored) {
+        const v = parseFloat(stored)
+        if (!Number.isNaN(v) && v >= 0.5 && v <= 2.5) setMeterGain(v)
+      }
+    } catch {}
+    // Devices
+    (async () => {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices()
+        const mics = devices.filter(d => d.kind === 'audioinput')
+        setAvailableMics(mics)
+        if (!selectedMicId && mics.length) setSelectedMicId(mics[0].deviceId)
+      } catch {}
+      try {
+        const res = await (window as any).electronAPI.getDesktopAudioSources?.()
+        if (res?.success && res.sources) {
+          setDesktopSources(res.sources)
+          if (!selectedDesktopSourceId && res.sources.length) setSelectedDesktopSourceId(res.sources[0].id)
+        }
+      } catch {}
+    })()
+  }, [voiceMenuOpen, selectedMicId, selectedDesktopSourceId])
+
+  // Outside click to close voice menu
+  useEffect(() => {
+    if (!voiceMenuOpen) return
+    const handler = (e: MouseEvent) => {
+      if (voiceMenuRef.current && !voiceMenuRef.current.contains(e.target as Node)) {
+        setVoiceMenuOpen(false)
+      }
+    }
+    window.addEventListener('mousedown', handler)
+    return () => window.removeEventListener('mousedown', handler)
+  }, [voiceMenuOpen])
+
+  const dispatchVoiceInputUpdate = (detail: any) => {
+    try { window.dispatchEvent(new CustomEvent('voice-input-settings-updated', { detail })) } catch {}
+  }
+
+  const applyMeterGain = (value: number) => {
+    setMeterGain(value)
+    try { localStorage.setItem('voice.meterGain', String(value)) } catch {}
+    dispatchVoiceInputUpdate({ meterGain: value })
+  }
 
   // Extract the repeated language selection logic into a separate function
   const extractLanguagesAndUpdate = (direction?: 'next' | 'prev') => {
@@ -147,8 +207,31 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
     setIsTooltipVisible(false)
   }
 
+  // Direct Solve Mode state (loaded from config once)
+  const [directSolveMode, setDirectSolveMode] = useState<boolean>(false)
+  useEffect(() => {
+    let mounted = true
+    ;(async () => {
+      try {
+        const cfg = await window.electronAPI.getConfig()
+        if (mounted) setDirectSolveMode(!!cfg.directSolveMode)
+      } catch (e) { /* silent */ }
+    })()
+    // Listen to global shortcut updates
+    const off = window.electronAPI.onDirectModeUpdated?.((d: { enabled: boolean }) => {
+      setDirectSolveMode(!!d.enabled)
+    })
+    return () => { mounted = false }
+  }, [])
+
+  const toggleDirectMode = async () => {
+    const newVal = !directSolveMode
+    setDirectSolveMode(newVal)
+    try { await window.electronAPI.updateConfig({ directSolveMode: newVal }) } catch {}
+  }
+
   return (
-    <div>
+    <div className="relative z-[12010]">{/* Elevated root to ensure tooltips/menu sit above voice overlay (z-[9999]) */}
       <div className="pt-2 w-fit">
         <div className="text-xs text-white/90 backdrop-blur-md bg-black/60 rounded-lg py-2 px-4 flex items-center justify-center gap-4">
           {/* Screenshot */}
@@ -228,28 +311,109 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
             </div>
           )}
 
-          {/* Voice Q&A Indicator */}
-          <div
-            className="flex flex-col cursor-default rounded px-2 py-1.5 hover:bg-white/10 transition-colors min-w-[130px]"
-            title="Press Ctrl/Cmd+M to start/stop Voice Q&A"
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-[11px] leading-none flex items-center gap-1">
-                <span className={`inline-block w-2 h-2 rounded-full ${voiceMode === 'listening' ? 'bg-amber-400 animate-pulse' : voiceMode === 'processing' ? 'bg-sky-400 animate-pulse' : 'bg-emerald-500'}`}></span>
-                Voice
-              </span>
-              <div className="flex gap-1">
-                <span className="bg-white/10 rounded-md px-1.5 py-1 text-[10px] leading-none text-white/70">{COMMAND_KEY}</span>
-                <span className="bg-white/10 rounded-md px-1.5 py-1 text-[10px] leading-none text-white/70">M</span>
+          {/* Direct Mode Checkbox (compact) */}
+          <div className="flex items-center gap-1 pl-2 pr-3 py-1.5 text-[10px] text-white/70 bg-white/5 rounded cursor-pointer hover:bg-white/10 select-none" onClick={toggleDirectMode} title="Direct Solve Mode: single-pass interpretation & solution (skip extraction phase)">
+            <input type="checkbox" checked={directSolveMode} onChange={toggleDirectMode} className="accent-white scale-90" />
+            <span>Direct</span>
+          </div>
+
+          {/* Voice Q&A Indicator with source menu */}
+          <div className="relative">
+            <div
+              className="flex flex-col cursor-pointer rounded px-2 py-1.5 hover:bg-white/10 transition-colors min-w-[130px]"
+              title="Press Ctrl/Cmd+M to start/stop Voice Q&A. Click to open input settings."
+              onClick={() => setVoiceMenuOpen(o => !o)}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] leading-none flex items-center gap-1">
+                  <span className={`inline-block w-2 h-2 rounded-full ${voiceMode === 'listening' ? 'bg-amber-400 animate-pulse' : voiceMode === 'processing' ? 'bg-sky-400 animate-pulse' : 'bg-emerald-500'}`}></span>
+                  Voice
+                  <svg className={`w-3 h-3 transition-transform ${voiceMenuOpen ? 'rotate-180' : ''}`} viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2" fill="none" strokeLinecap="round" strokeLinejoin="round"><polyline points="6 9 12 15 18 9" /></svg>
+                </span>
+                <div className="flex gap-1">
+                  <span className="bg-white/10 rounded-md px-1.5 py-1 text-[10px] leading-none text-white/70">{COMMAND_KEY}</span>
+                  <span className="bg-white/10 rounded-md px-1.5 py-1 text-[10px] leading-none text-white/70">M</span>
+                </div>
+              </div>
+              <div className="mt-1 text-[10px] text-white/60 line-clamp-2 max-w-[180px]">
+                {voiceMode === 'listening' && 'Listening… speak your question'}
+                {voiceMode === 'processing' && (voicePhaseMsg || 'Processing…')}
+                {voiceMode === 'idle' && (
+                  voiceLastQuestion ? `Q: ${voiceLastQuestion.slice(0,40)}…` : 'Ready'
+                )}
               </div>
             </div>
-            <div className="mt-1 text-[10px] text-white/60 line-clamp-2 max-w-[180px]">
-              {voiceMode === 'listening' && 'Listening… speak your question'}
-              {voiceMode === 'processing' && (voicePhaseMsg || 'Processing…')}
-              {voiceMode === 'idle' && (
-                voiceLastQuestion ? `Q: ${voiceLastQuestion.slice(0,40)}…` : 'Ready'
-              )}
-            </div>
+            {voiceMenuOpen && (
+              <div ref={voiceMenuRef} className="absolute top-full left-0 mt-2 w-72 z-[12015]">
+                <div className="p-3 text-xs bg-black/85 backdrop-blur-md rounded-lg border border-white/10 text-white/90 shadow-lg space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium">Input Source</span>
+                    <button onClick={() => setVoiceMenuOpen(false)} className="text-white/40 hover:text-white/70 text-[10px]">Close</button>
+                  </div>
+                  <div className="flex gap-2">
+                    {(['mic','system','mixed'] as const).map(mode => (
+                      <button
+                        key={mode}
+                        onClick={() => { setInputMode(mode); dispatchVoiceInputUpdate({ inputMode: mode }) }}
+                        className={`flex-1 px-2 py-1 rounded border text-[11px] capitalize transition-colors ${inputMode === mode ? 'bg-white/15 border-white/30' : 'bg-white/5 border-white/10 hover:bg-white/10'}`}
+                      >{mode}</button>
+                    ))}
+                  </div>
+                  {(inputMode === 'mic' || inputMode === 'mixed') && (
+                    <div className="space-y-1">
+                      <label className="text-[10px] uppercase tracking-wide text-white/50">Microphone</label>
+                      <select
+                        className="w-full bg-white/5 border border-white/10 rounded px-2 py-1 text-[11px] focus:outline-none focus:ring-1 focus:ring-white/30"
+                        value={selectedMicId}
+                        onChange={e => { setSelectedMicId(e.target.value); dispatchVoiceInputUpdate({ micId: e.target.value }) }}
+                      >
+                        {availableMics.map(m => (
+                          <option key={m.deviceId} value={m.deviceId}>{m.label || 'Microphone'}</option>
+                        ))}
+                      </select>
+                      {availableMics.length === 0 && <div className="text-[10px] text-amber-400/90">No microphones detected</div>}
+                    </div>
+                  )}
+                  {(inputMode === 'system' || inputMode === 'mixed') && (
+                    <div className="space-y-1">
+                      <label className="text-[10px] uppercase tracking-wide text-white/50">System Audio Source</label>
+                      <select
+                        className="w-full bg-white/5 border border-white/10 rounded px-2 py-1 text-[11px] focus:outline-none focus:ring-1 focus:ring-white/30"
+                        value={selectedDesktopSourceId}
+                        onChange={e => { setSelectedDesktopSourceId(e.target.value); dispatchVoiceInputUpdate({ desktopSourceId: e.target.value }) }}
+                      >
+                        {desktopSources.map(s => (
+                          <option key={s.id} value={s.id}>{s.name}</option>
+                        ))}
+                      </select>
+                      {desktopSources.length === 0 && <div className="text-[10px] text-amber-400/90">No system sources (grant screen recording?)</div>}
+                    </div>
+                  )}
+                  <div className="space-y-1">
+                    <label className="text-[10px] uppercase tracking-wide text-white/50 flex items-center justify-between">
+                      Meter Gain
+                      <span className="text-white/40">{meterGain.toFixed(2)}x</span>
+                    </label>
+                    <input
+                      type="range"
+                      min={0.5}
+                      max={2.5}
+                      step={0.05}
+                      value={meterGain}
+                      onChange={e => applyMeterGain(parseFloat(e.target.value))}
+                      className="w-full"
+                    />
+                    <p className="text-[10px] text-white/40 leading-snug">Adjust visualization sensitivity. Does not change submitted audio.</p>
+                  </div>
+                  <div className="flex justify-end">
+                    <button
+                      onClick={() => { setVoiceMenuOpen(false) }}
+                      className="px-3 py-1 rounded bg-white/10 hover:bg-white/20 text-[11px]"
+                    >Done</button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Separator */}
@@ -282,8 +446,12 @@ const QueueCommands: React.FC<QueueCommandsProps> = ({
             {isTooltipVisible && (
               <div
                 ref={tooltipRef}
-                className="absolute top-full left-0 mt-2 w-80 transform -translate-x-[calc(50%-12px)]"
-                style={{ zIndex: 100 }}
+                className="absolute top-full left-0 mt-2 w-80 transform -translate-x-[calc(50%-12px)] z-[12010]"
+                style={{
+                  // Elevate above voice overlay (z-[9999]) and standard dialogs/toasts
+                  // SettingsDialog uses 12000 so we pick 12010 to sit just above while not going extreme
+                  zIndex: 12010
+                }}
               >
                 {/* Add transparent bridge */}
                 <div className="absolute -top-2 right-0 w-full h-2" />

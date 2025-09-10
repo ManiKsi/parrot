@@ -59,6 +59,10 @@ interface ElectronAPI {
   installUpdate: () => void
   onUpdateAvailable: (callback: (info: any) => void) => () => void
   onUpdateDownloaded: (callback: (info: any) => void) => () => void
+  // Config helpers
+  getConfig?: () => Promise<any>
+  updateConfig?: (config: { apiKey?: string; apiProvider?: string; extractionModel?: string; solutionModel?: string; debuggingModel?: string; directSolveMode?: boolean }) => Promise<any>
+  onDirectModeUpdated?: (cb: (data: { enabled: boolean }) => void) => () => void
 }
 
 interface Window {

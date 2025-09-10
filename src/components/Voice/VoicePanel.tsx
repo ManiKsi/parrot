@@ -24,6 +24,8 @@ const formatTime = (ms: number) => {
  * Reuses event logic from overlay but with a full-width adaptive layout.
  */
 const VoicePanel: React.FC = () => {
+  // Central settings dialog now owns model/history/context; hide inline duplicates unless enabled for debugging.
+  const SHOW_ADVANCED_INLINE_SETTINGS = false
   const [state, setState] = useState<VoiceState>({ mode: 'idle' })
   const [context, setContext] = useState('')
   const [contextDirty, setContextDirty] = useState(false)
@@ -31,8 +33,9 @@ const VoicePanel: React.FC = () => {
   const [modelSaving, setModelSaving] = useState(false)
   const [historyEnabled, setHistoryEnabled] = useState(true)
   const [history, setHistory] = useState<HistoryTurn[]>([])
-  // Settings panel default visible so user can configure BEFORE first recording
-  const [showSettings, setShowSettings] = useState(true)
+  // Microphone / input settings now presented as a dropdown menu instead of inline sidebar
+  const [micMenuOpen, setMicMenuOpen] = useState(false)
+  const micMenuRef = useRef<HTMLDivElement | null>(null)
   const [inputMode, setInputMode] = useState<'mic' | 'system' | 'mixed'>('mic')
   const [availableMics, setAvailableMics] = useState<MediaDeviceInfo[]>([])
   const [selectedMicId, setSelectedMicId] = useState<string>('')
@@ -47,6 +50,8 @@ const VoicePanel: React.FC = () => {
   const timerRef = useRef<number | null>(null)
   const [hiddenForCapture, setHiddenForCapture] = useState(false)
   const conversationRef = useRef<HTMLDivElement | null>(null)
+  // Auto-scroll management
+  const [autoScrollPinned, setAutoScrollPinned] = useState(true)
   // Audio level meter state & refs
   const [micLevel, setMicLevel] = useState(0)
   const [systemLevel, setSystemLevel] = useState(0)
@@ -388,6 +393,15 @@ const VoicePanel: React.FC = () => {
     }
   }, [state.mode])
 
+  // Abort current processing (LLM/STT) if in processing mode
+  const abortProcessing = useCallback(async () => {
+    if (state.mode !== 'processing') return
+    try {
+      await (window as any).electronAPI.voice.abortProcessing?.()
+    } catch {}
+    setState({ mode: 'idle' })
+  }, [state.mode])
+
   // Capture hide events
   useEffect(() => {
     const offPrep = (window as any).electronAPI?.onCapturePrepare?.(() => setHiddenForCapture(true))
@@ -430,7 +444,12 @@ const VoicePanel: React.FC = () => {
     const offError = api.onError((err: string) => {
       setState({ mode: 'idle', error: err })
     })
-    return () => { offStatus && offStatus(); offResult && offResult(); offPartial && offPartial(); offError && offError() }
+    const offAborted = api.onAborted((data?: any) => {
+      // Clear transient streaming state on abort
+      setState({ mode: 'idle', question: state.question, answer: undefined, requestId: undefined })
+      currentRequestIdRef.current = null
+    })
+    return () => { offStatus && offStatus(); offResult && offResult(); offPartial && offPartial(); offError && offError(); offAborted && offAborted() }
   }, [])
 
   // Load persisted context/model/history
@@ -446,25 +465,86 @@ const VoicePanel: React.FC = () => {
     })()
   }, [])
 
-  // Enumerate audio input devices (microphones) and desktop sources for system audio
+  // Listen for external settings updates dispatched from SettingsDialog
   useEffect(() => {
+    const handler = (e: Event) => {
+      const detail: any = (e as CustomEvent).detail || {}
+      if (typeof detail.model === 'string') setModel(detail.model)
+      if (typeof detail.context === 'string') setContext(detail.context)
+      if (typeof detail.historyEnabled === 'boolean') setHistoryEnabled(detail.historyEnabled)
+      if (detail.historyCleared) setHistory([])
+    }
+    window.addEventListener('voice-settings-updated', handler as EventListener)
+    return () => window.removeEventListener('voice-settings-updated', handler as EventListener)
+  }, [])
+
+  // Listen for input source quick menu updates from QueueCommands
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail: any = (e as CustomEvent).detail || {}
+      if (detail.inputMode && ['mic','system','mixed'].includes(detail.inputMode)) {
+        setInputMode(detail.inputMode)
+      }
+      if (typeof detail.micId === 'string') setSelectedMicId(detail.micId)
+      if (typeof detail.desktopSourceId === 'string') setSelectedDesktopSourceId(detail.desktopSourceId)
+      if (typeof detail.meterGain === 'number') {
+        setMeterGain(detail.meterGain)
+      }
+    }
+    window.addEventListener('voice-input-settings-updated', handler as EventListener)
+    return () => window.removeEventListener('voice-input-settings-updated', handler as EventListener)
+  }, [])
+
+  // Broadcast local input settings changes for cross-component sync
+  const dispatchInputSettings = useCallback((next?: Partial<{ inputMode: string; micId: string; desktopSourceId: string; meterGain: number }>) => {
+    const detail = {
+      inputMode,
+      micId: selectedMicId,
+      desktopSourceId: selectedDesktopSourceId,
+      meterGain,
+      ...(next || {})
+    }
+    window.dispatchEvent(new CustomEvent('voice-input-settings-updated', { detail }))
+  }, [inputMode, selectedMicId, selectedDesktopSourceId, meterGain])
+
+  // Enumerate audio input devices (microphones) & desktop sources when menu opens or if defaults missing
+  useEffect(() => {
+    if (!micMenuOpen && selectedMicId && selectedDesktopSourceId) return
     const enumerate = async () => {
       try {
         const devices = await navigator.mediaDevices.enumerateDevices()
         const mics = devices.filter(d => d.kind === 'audioinput')
         setAvailableMics(mics)
-        if (!selectedMicId && mics.length) setSelectedMicId(mics[0].deviceId)
+        if (!selectedMicId && mics.length) {
+          setSelectedMicId(mics[0].deviceId)
+          dispatchInputSettings({ micId: mics[0].deviceId })
+        }
       } catch {}
       try {
         const res = await (window as any).electronAPI.getDesktopAudioSources()
         if (res?.success && res.sources) {
           setDesktopSources(res.sources)
-          if (!selectedDesktopSourceId && res.sources.length) setSelectedDesktopSourceId(res.sources[0].id)
+          if (!selectedDesktopSourceId && res.sources.length) {
+            setSelectedDesktopSourceId(res.sources[0].id)
+            dispatchInputSettings({ desktopSourceId: res.sources[0].id })
+          }
         }
       } catch {}
     }
     enumerate()
-  }, [selectedMicId, selectedDesktopSourceId])
+  }, [micMenuOpen, selectedMicId, selectedDesktopSourceId, dispatchInputSettings])
+
+  // Outside click to close mic menu
+  useEffect(() => {
+    if (!micMenuOpen) return
+    const handle = (e: MouseEvent) => {
+      if (!micMenuRef.current) return
+      if (micMenuRef.current.contains(e.target as Node)) return
+      setMicMenuOpen(false)
+    }
+    window.addEventListener('mousedown', handle)
+    return () => window.removeEventListener('mousedown', handle)
+  }, [micMenuOpen])
 
   // Debounced context save
   useEffect(() => {
@@ -488,10 +568,29 @@ const VoicePanel: React.FC = () => {
 
   // Auto-scroll conversation on new partials / results
   useEffect(() => {
-    if (!conversationRef.current) return
-    // Smooth scroll to bottom whenever answer or history updates
-    conversationRef.current.scrollTo({ top: conversationRef.current.scrollHeight, behavior: 'smooth' })
-  }, [state.answer, state.mode, history.length])
+    const el = conversationRef.current
+    if (!el) return
+    if (!autoScrollPinned) return
+    // During streaming (processing mode) use immediate jump to avoid rubber-banding
+    if (state.mode === 'processing') {
+      el.scrollTop = el.scrollHeight
+    } else {
+      // On final result allow smooth scroll once
+      el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+    }
+  }, [state.answer, state.mode, history.length, autoScrollPinned])
+
+  // Track user manual scrolling to disable auto pin until they return near bottom
+  useEffect(() => {
+    const el = conversationRef.current
+    if (!el) return
+    const handleScroll = () => {
+      const atBottom = (el.scrollHeight - (el.scrollTop + el.clientHeight)) < 32
+      setAutoScrollPinned(atBottom)
+    }
+    el.addEventListener('scroll', handleScroll, { passive: true })
+    return () => el.removeEventListener('scroll', handleScroll)
+  }, [])
 
   // (Settings remain visible across resets to allow pre-configuration.)
 
@@ -528,19 +627,21 @@ const VoicePanel: React.FC = () => {
   }, [state.mode, inputMode, systemLevel])
 
   return (
-  <div id="voice-panel" data-hidden={hiddenForCapture ? '1' : '0'} className={`mt-4 rounded-xl border border-white/10 bg-black/55 backdrop-blur-md p-4 text-white w-full max-w-[720px] transition-opacity duration-100 ${hiddenForCapture ? 'opacity-0 pointer-events-none select-none' : 'opacity-100'}`}> 
-      <div className="flex items-start justify-between flex-wrap gap-4">
+  <div id="voice-panel" data-hidden={hiddenForCapture ? '1' : '0'} className={`relative mt-4 rounded-xl border border-white/10 bg-black/55 backdrop-blur-md p-4 text-white w-full max-w-[720px] transition-opacity duration-100 ${hiddenForCapture ? 'opacity-0 pointer-events-none select-none' : 'opacity-100'}`}> 
+      <div className="flex items-start justify-between flex-wrap gap-4 relative">
         <div className="space-y-1">
           <h2 className="text-sm font-semibold tracking-wide flex items-center gap-2">
             Voice Q&A
             <button
-              aria-label={showSettings ? 'Hide voice settings' : 'Show voice settings'}
-              onClick={() => setShowSettings(s => !s)}
-              className="p-1 rounded hover:bg-white/10 transition-colors"
+              aria-label={micMenuOpen ? 'Close microphone/input settings menu' : 'Open microphone/input settings menu'}
+              onClick={() => setMicMenuOpen(o => !o)}
+              className={`p-1 rounded hover:bg-white/10 transition-colors ${micMenuOpen ? 'text-amber-400' : 'text-white/60'}`}
             >
-              <svg viewBox="0 0 24 24" className={`w-4 h-4 ${showSettings ? 'text-amber-400' : 'text-white/60'}`} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
-                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09c0 .67.39 1.27 1 1.51.23.1.46.23.67.38.26.2.49.43.69.69.15.21.28.44.38.67.24.61.84 1 1.51 1H21a2 2 0 0 1 0 4h-.09c-.67 0-1.27.39-1.51 1 .1.23.23.46.38.67.2.26.43.49.69.69Z" />
+              <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 1v4" />
+                <path d="M12 19v4" />
+                <rect x="9" y="5" width="6" height="10" rx="3" />
+                <path d="M5 10a7 7 0 0 0 14 0" />
               </svg>
             </button>
           </h2>
@@ -603,16 +704,15 @@ const VoicePanel: React.FC = () => {
             <button onClick={stopRecording} className="px-4 py-2 rounded-md bg-amber-600/80 hover:bg-amber-500 text-xs font-medium animate-pulse">Finish</button>
           )}
           {state.mode === 'processing' && (
-            <div className="px-4 py-2 rounded-md bg-sky-700/70 text-xs font-medium flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-sky-300 animate-ping" /> Processing
-            </div>
+            <button onClick={abortProcessing} className="px-4 py-2 rounded-md bg-sky-700/70 hover:bg-sky-600/70 text-xs font-medium flex items-center gap-2" title="Abort processing and reset">
+              <span className="w-2 h-2 rounded-full bg-sky-300 animate-ping" /> Processing (Click to Abort)
+            </button>
           )}
         </div>
       </div>
 
-      {/* Conversation & (optional) settings */}
-      <div className={`mt-4 grid gap-6 ${showSettings ? 'grid-cols-1 md:grid-cols-5' : 'grid-cols-1'}`}>
-        <div className={`${showSettings ? 'md:col-span-3' : 'md:col-span-5'} space-y-3 max-h-[65vh] overflow-auto pr-1 custom-scrollbar`} ref={conversationRef}>
+      {/* Conversation */}
+      <div className="mt-4 space-y-3 max-h-[65vh] overflow-auto pr-1 custom-scrollbar" ref={conversationRef}>
           {history.length === 0 && !state.question && (
             <div className="text-[12px] text-white/50">No conversation yet. Ask your first question.</div>
           )}
@@ -641,139 +741,90 @@ const VoicePanel: React.FC = () => {
             </div>
           )}
         </div>
-        {showSettings && (
-          <div className="md:col-span-2 space-y-4 animate-fadeIn">
-            <div className="space-y-2">
-              <div className="space-y-1">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] uppercase tracking-wide text-white/60">Input Source</span>
-                </div>
-                <div className="flex flex-wrap gap-2 text-[11px]">
-                  {(['mic','system','mixed'] as const).map(mode => (
-                    <button
-                      key={mode}
-                      onClick={() => setInputMode(mode)}
-                      className={`px-2 py-1 rounded border ${inputMode===mode ? 'border-amber-400 bg-amber-500/20 text-amber-200' : 'border-white/10 text-white/60 hover:bg-white/5'}`}
-                    >{mode === 'mic' ? 'Microphone' : mode === 'system' ? 'System' : 'Mixed'}</button>
-                  ))}
-                </div>
-                {inputMode !== 'system' && (
-                  <div className="mt-2 space-y-1">
-                    <label className="text-[10px] uppercase tracking-wide text-white/40">Microphone</label>
-                    <select
-                      value={selectedMicId}
-                      onChange={e => setSelectedMicId(e.target.value)}
-                      className="w-full bg-zinc-800/60 border border-zinc-700/50 rounded px-2 py-1 text-[12px] focus:outline-none focus:ring-1 focus:ring-amber-400/60"
-                    >
-                      {availableMics.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || 'Microphone'}</option>)}
-                    </select>
-                  </div>
-                )}
-                <div className="mt-4 space-y-1">
-                  <label className="text-[10px] uppercase tracking-wide text-white/40 flex justify-between">
-                    <span>Meter Sensitivity</span>
-                    <span className="text-white/50">{meterGain.toFixed(2)}x</span>
-                  </label>
-                  <input
-                    type="range"
-                    min={0.5}
-                    max={2.5}
-                    step={0.1}
-                    value={meterGain}
-                    onChange={e => setMeterGain(parseFloat(e.target.value))}
-                    className="w-full accent-amber-400"
-                  />
-                  <p className="text-[10px] text-white/40">Lower if the bar pegs at 100% when speaking normally.</p>
-                </div>
-                {inputMode !== 'mic' && (
-                  <div className="mt-2 space-y-1">
-                    <label className="text-[10px] uppercase tracking-wide text-white/40">System Source (Screen)</label>
-                    <select
-                      value={selectedDesktopSourceId}
-                      onChange={e => setSelectedDesktopSourceId(e.target.value)}
-                      className="w-full bg-zinc-800/60 border border-zinc-700/50 rounded px-2 py-1 text-[12px] focus:outline-none focus:ring-1 focus:ring-amber-400/60"
-                    >
-                      {desktopSources.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
-                    </select>
-                    <p className="text-[10px] text-white/40 leading-snug">MacOS may require a virtual loopback device (e.g. BlackHole) or screen capture permission to include system audio.</p>
-                    <div className="mt-2 flex flex-wrap gap-2 items-center text-[10px]">
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          try {
-                            const res = await (window as any).electronAPI.getScreenPermissions?.()
-                            if (res?.success) {
-                              setPermDiagnostics(`platform=${res.platform} screen=${res.screenAccess||'n/a'} mic=${res.micAccess||'n/a'} cam=${res.cameraAccess||'n/a'} chrome=${res.chromeVersion}`)
-                            } else {
-                              setPermDiagnostics('permission query failed: ' + (res?.error||'unknown'))
-                            }
-                          } catch (e:any) {
-                            setPermDiagnostics('permission query error: ' + (e?.message||e))
-                          }
-                        }}
-                        className="px-2 py-1 bg-zinc-700/60 hover:bg-zinc-600/70 rounded border border-white/10"
-                      >Permissions Diagnostic</button>
-                      {permDiagnostics && <span className="text-white/50 break-all max-w-full">{permDiagnostics}</span>}
-                    </div>
-                    {systemCaptureMethod && (
-                      <div className="mt-1 text-[10px] text-white/40">Method: {systemCaptureMethod}{systemDebug && ` • ${systemDebug}`}</div>
-                    )}
-                  </div>
-                )}
-              </div>
-              <div className="h-px w-full bg-white/10" />
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] uppercase tracking-wide text-white/60">Model</span>
-                {state.model && state.mode === 'idle' && state.answer && (
-                  <span className="text-[10px] text-white/40">Active: {state.model}</span>
-                )}
-              </div>
-              <div className="flex gap-2">
-                <input
-                  className="flex-1 bg-zinc-800/60 border border-zinc-700/50 rounded px-2 py-1 text-[12px] focus:outline-none focus:ring-1 focus:ring-amber-400/60"
-                  placeholder="e.g. phi3:latest"
-                  value={model}
-                  onChange={e => setModel(e.target.value)}
-                />
-                <button
-                  className="px-3 py-1 bg-amber-600/80 hover:bg-amber-500 text-[12px] rounded disabled:opacity-50"
-                  disabled={!model || modelSaving}
-                  onClick={async () => { setModelSaving(true); try { await (window as any).electronAPI.voice.setModel(model) } finally { setModelSaving(false) } }}
-                >{modelSaving ? 'Saving…' : 'Apply'}</button>
-              </div>
+      {micMenuOpen && (
+        <div ref={micMenuRef} className="absolute z-[12020] top-14 right-4 w-80 max-h-[70vh] overflow-auto custom-scrollbar rounded-md border border-white/10 bg-zinc-950/95 backdrop-blur shadow-xl p-4 text-[11px] space-y-4">
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="uppercase tracking-wide text-white/60 text-[10px]">Input Mode</span>
+              <button onClick={() => setMicMenuOpen(false)} className="text-white/40 hover:text-white/70 text-[10px]">Close</button>
             </div>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] uppercase tracking-wide text-white/60">History</span>
-                <label className="text-[11px] flex items-center gap-1 select-none">
-                  <input type="checkbox" checked={historyEnabled} onChange={async e => { const en = e.target.checked; setHistoryEnabled(en); try { await (window as any).electronAPI.voice.setHistoryEnabled(en) } catch {} }} />
-                  <span className="text-white/70">Enabled</span>
-                </label>
-              </div>
-              <div className="flex gap-2 text-[11px]">
+            <div className="flex flex-wrap gap-2">
+              {(['mic','system','mixed'] as const).map(mode => (
                 <button
-                  className="px-2 py-1 bg-zinc-700/60 hover:bg-zinc-600/70 rounded disabled:opacity-50"
-                  disabled={!history.length}
-                  onClick={async () => { try { await (window as any).electronAPI.voice.clearHistory(); setHistory([]) } catch {} }}
-                >Clear History</button>
-                <div className="text-white/40 self-center">Turns: {history.length}</div>
-              </div>
-            </div>
-            <div className="space-y-1">
-              <span className="text-[11px] uppercase tracking-wide text-white/60">Context</span>
-              <textarea
-                className="mt-1 w-full h-24 bg-zinc-800/60 border border-zinc-700/50 rounded p-2 text-[12px] focus:outline-none focus:ring-1 focus:ring-amber-400/60 resize-y"
-                value={context}
-                placeholder="Add interviewing context, constraints, style guidance…"
-                onChange={e => { setContext(e.target.value); setContextDirty(true) }}
-              />
-              {contextDirty && <div className="text-[10px] text-amber-400/80">Saving…</div>}
+                  key={mode}
+                  onClick={() => { setInputMode(mode); dispatchInputSettings({ inputMode: mode }) }}
+                  className={`px-2 py-1 rounded border ${inputMode===mode ? 'border-amber-400 bg-amber-500/20 text-amber-200' : 'border-white/10 text-white/60 hover:bg-white/5'}`}
+                >{mode === 'mic' ? 'Microphone' : mode === 'system' ? 'System' : 'Mixed'}</button>
+              ))}
             </div>
           </div>
-        )}
-      </div>
+          {inputMode !== 'system' && (
+            <div className="space-y-1">
+              <label className="text-[10px] uppercase tracking-wide text-white/40">Microphone</label>
+              <select
+                value={selectedMicId}
+                onChange={e => { setSelectedMicId(e.target.value); dispatchInputSettings({ micId: e.target.value }) }}
+                className="w-full bg-zinc-800/60 border border-zinc-700/50 rounded px-2 py-1 text-[12px] focus:outline-none focus:ring-1 focus:ring-amber-400/60"
+              >
+                {availableMics.map(d => <option key={d.deviceId} value={d.deviceId}>{d.label || 'Microphone'}</option>)}
+              </select>
+            </div>
+          )}
+          <div className="space-y-1">
+            <label className="text-[10px] uppercase tracking-wide text-white/40 flex justify-between">
+              <span>Meter Sensitivity</span>
+              <span className="text-white/50">{meterGain.toFixed(2)}x</span>
+            </label>
+            <input
+              type="range"
+              min={0.5}
+              max={2.5}
+              step={0.1}
+              value={meterGain}
+              onChange={e => { const v = parseFloat(e.target.value); setMeterGain(v); dispatchInputSettings({ meterGain: v }) }}
+              className="w-full accent-amber-400"
+            />
+            <p className="text-[10px] text-white/40">Lower if bar pegs at 100% while speaking normally.</p>
+          </div>
+          {inputMode !== 'mic' && (
+            <div className="space-y-1">
+              <label className="text-[10px] uppercase tracking-wide text-white/40">System Source / Screen</label>
+              <select
+                value={selectedDesktopSourceId}
+                onChange={e => { setSelectedDesktopSourceId(e.target.value); dispatchInputSettings({ desktopSourceId: e.target.value }) }}
+                className="w-full bg-zinc-800/60 border border-zinc-700/50 rounded px-2 py-1 text-[12px] focus:outline-none focus:ring-1 focus:ring-amber-400/60"
+              >
+                {desktopSources.map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+              <p className="text-[10px] text-white/40 leading-snug">macOS may need loopback (e.g. BlackHole) or Screen Recording permission for system audio.</p>
+              <div className="mt-2 flex flex-wrap gap-2 items-center text-[10px]">
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const res = await (window as any).electronAPI.getScreenPermissions?.()
+                      if (res?.success) {
+                        setPermDiagnostics(`platform=${res.platform} screen=${res.screenAccess||'n/a'} mic=${res.micAccess||'n/a'} cam=${res.cameraAccess||'n/a'} chrome=${res.chromeVersion}`)
+                      } else {
+                        setPermDiagnostics('permission query failed: ' + (res?.error||'unknown'))
+                      }
+                    } catch (e:any) {
+                      setPermDiagnostics('permission query error: ' + (e?.message||e))
+                    }
+                  }}
+                  className="px-2 py-1 bg-zinc-700/60 hover:bg-zinc-600/70 rounded border border-white/10"
+                >Permissions Diagnostic</button>
+                {permDiagnostics && <span className="text-white/50 break-all max-w-full">{permDiagnostics}</span>}
+              </div>
+              {systemCaptureMethod && (
+                <div className="mt-1 text-[10px] text-white/40">Method: {systemCaptureMethod}{systemDebug && ` • ${systemDebug}`}</div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       {state.mode === 'idle' && !hasConversation && !state.error && (
-        <div className="mt-4 text-[11px] text-white/50">Configure input sources & model, then press the shortcut or Start Talking to begin.</div>
+        <div className="mt-4 text-[11px] text-white/50">Open the microphone icon menu to configure input sources, then press the shortcut or Start Talking.</div>
       )}
     </div>
   )
